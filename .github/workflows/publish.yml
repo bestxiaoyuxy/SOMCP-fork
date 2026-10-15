@@ -22,6 +22,30 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # --- Reusable fixed signing keystore (cached across runs) ---
+      - name: Restore fixed keystore from cache
+        uses: actions/cache/restore@v4
+        with:
+          path: release/somcp-release.jks
+          key: somcp-fixed-keystore-v1
+          lookup-only: false
+
+      - name: Generate keystore if not cached
+        if: hashFiles('release/somcp-release.jks') == ''
+        run: |
+          mkdir -p release
+          keytool -genkeypair \
+            -keystore release/somcp-release.jks \
+            -alias somcp \
+            -storepass somcp1234 \
+            -keypass somcp1234 \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10950 \
+            -dname "CN=SOMCP, OU=Dev, O=SOMCP, L=CI, ST=CI, C=US"
+          echo "Generated new keystore (first run)."
+
+      # --- Android SDK ---
       - name: Install Android SDK
         run: |
           mkdir -p $ANDROID_HOME/cmdline-tools
@@ -40,6 +64,7 @@ jobs:
           ln -sf /opt/gradle-9.6.1/bin/gradle /usr/local/bin/gradle
           gradle --version
 
+      # --- Native build tools ---
       - name: Install native build tools
         run: |
           sudo apt-get update
@@ -47,6 +72,7 @@ jobs:
             meson ninja-build gcc g++ pkg-config \
             zlib1g-dev
 
+      # --- Rizin + LIEF ---
       - name: Clone Rizin source (v0.9.1)
         run: |
           if [ ! -d third_party/rizin-src/librz/include ]; then
@@ -56,30 +82,87 @@ jobs:
       - name: Build native backends (Rizin + LIEF)
         run: bash build-native-android.sh
 
+      # --- Unidbg natives ---
       - name: Build Unidbg native libs (capstone/keystone/unicorn)
         run: |
           set -euo pipefail
           for abi in arm64-v8a armeabi-v7a x86 x86_64; do
             bash build-unidbg-native.sh --abi "$abi"
           done
+          for abi in arm64-v8a x86_64; do
+            for lib in capstone keystone unicorn; do
+              test -f "app/src/main/jniLibs/$abi/lib$lib.so" || {
+                echo "::error::missing jniLibs/$abi/lib$lib.so"
+                exit 1
+              }
+            done
+          done
+          echo "Unidbg native libs present."
 
-      - name: Generate release signing keystore
+      # --- rz-ghidra ---
+      - name: Build rz-ghidra plugin (libcore_ghidra.so)
+        run: bash build-rz-ghidra-android.sh
+
+      - name: Verify rz-ghidra in jniLibs
         run: |
-          keytool -genkeypair \
-            -v \
-            -keystore somcp-release.jks \
-            -alias somcp \
-            -storepass somcp1234 \
-            -keypass somcp1234 \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10950 \
-            -dname "CN=SOMCP, OU=Dev, O=SOMCP, L=CI, ST=CI, C=US"
+          set -euo pipefail
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            test -f "app/src/main/jniLibs/$abi/libcore_ghidra.so" || {
+              echo "::error::missing $abi/libcore_ghidra.so"
+              exit 1
+            }
+          done
+          echo "libcore_ghidra.so present for all ABIs."
 
+      # --- cloudflared ---
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "stable"
+          cache: false
+
+      - name: Cross-compile cloudflared for Android
+        run: |
+          set -euo pipefail
+          CLOUDFLARED_TAG="2026.8.3"
+          git clone --depth 1 --branch "$CLOUDFLARED_TAG" \
+            https://github.com/cloudflare/cloudflared.git cloudflared-src
+          (
+            cd cloudflared-src
+            GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" \
+              -o ../libcloudflared-arm64-v8a ./cmd/cloudflared
+            GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" \
+              -o ../libcloudflared-armeabi-v7a ./cmd/cloudflared
+            GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" \
+              -o ../libcloudflared-x86_64 ./cmd/cloudflared
+            GOOS=linux GOARCH=386 CGO_ENABLED=0 \
+              go build -trimpath -ldflags="-s -w" \
+              -o ../libcloudflared-x86 ./cmd/cloudflared
+          )
+          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+            mkdir -p "app/src/main/jniLibs/$abi"
+            cp "libcloudflared-${abi}" "app/src/main/jniLibs/$abi/libcloudflared.so"
+            test -f "app/src/main/jniLibs/$abi/libcloudflared.so" || {
+              echo "::error::missing $abi/libcloudflared.so"
+              exit 1
+            }
+          done
+          echo "cloudflared cross-compiled and bundled."
+
+      # --- Blutter runners (best-effort) ---
+      - name: Build Blutter runners
+        continue-on-error: true
+        run: |
+          bash tools/blutter-matrix/build-blutter-runners.sh
+
+      # --- Build APKs ---
       - name: Build APKs
         run: |
           gradle assembleRelease \
-            -PstoreFile=$(pwd)/somcp-release.jks \
+            -PstoreFile=$(pwd)/release/somcp-release.jks \
             -PstorePassword=somcp1234 \
             -PkeyAlias=somcp \
             -PkeyPassword=somcp1234 \
@@ -88,31 +171,22 @@ jobs:
 
       - name: List built APKs
         run: |
-          echo "=== APK output directory ==="
+          echo "=== APK output ==="
           find app/build/outputs/apk -name "*.apk" -exec ls -lh {} \;
 
       - name: Collect and rename APKs
         run: |
-          mkdir -p release
+          mkdir -p dist
           VERSION="${GITHUB_REF_NAME#publish/}"
           if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
             VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
           fi
-          echo "Version label: $VERSION"
-
-          # Map each ABI to its expected APK filename
-          declare -A ABI_PATTERNS=(
-            ["arm64-v8a"]="arm64-v8a"
-            ["armeabi-v7a"]="armeabi-v7a"
-            ["x86"]="x86"
-            ["x86_64"]="x86_64"
-            ["universal"]="universal"
-          )
+          echo "Version: $VERSION"
 
           for abi in arm64-v8a armeabi-v7a x86 x86_64 universal; do
             APK=$(find app/build/outputs/apk -name "*.apk" 2>/dev/null | grep -i "${abi}" | head -1)
             if [ -n "$APK" ]; then
-              cp "$APK" "release/SOMCP-${VERSION}-${abi}.apk"
+              cp "$APK" "dist/SOMCP-${VERSION}-${abi}.apk"
               echo "  ✓ $abi → SOMCP-${VERSION}-${abi}.apk"
             else
               echo "  ✗ No APK found for $abi"
@@ -120,10 +194,10 @@ jobs:
           done
 
           echo ""
-          echo "=== Release contents ==="
-          ls -lh release/
-          test -d release/ && test -n "$(ls release/*.apk 2>/dev/null)" || {
-            echo "::error::No APKs were produced. Check the build log above."
+          echo "=== Release files ==="
+          ls -lh dist/
+          test -n "$(ls dist/*.apk 2>/dev/null)" || {
+            echo "::error::No APKs produced."
             exit 1
           }
 
@@ -131,7 +205,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          files: release/*.apk
+          files: dist/*.apk
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
