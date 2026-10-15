@@ -21,10 +21,8 @@ import android.content.Context
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
 import android.os.Build
-import android.os.Debug
 import android.os.Process
 import com.soreverse.mcp.nativecore.NativeProbe
-import java.io.File
 import java.security.MessageDigest
 import kotlin.random.Random
 import kotlin.system.exitProcess
@@ -35,15 +33,6 @@ object IntegrityGuard {
     @Volatile private var cached: Pair<Long, Result>? = null
 
     private val scheduleLock = Any()
-
-    /**
-     * The one component factory a genuine build of this app can declare:
-     * `androidx.core:core` (transitive, via `androidx.activity:activity-compose`)
-     * puts it in its own manifest and the merger copies it into the shipped
-     * APK. Read as a constant rather than a literal at the comparison site so
-     * the allowlist has one definition to audit.
-     */
-    private const val ANDROIDX_COMPONENT_FACTORY = "androidx.core.app.CoreComponentFactory"
 
     @Volatile private var recheckStarted = false
 
@@ -288,36 +277,26 @@ object IntegrityGuard {
         }
         val result = runCatching {
             val expected = NativeProbe.pinnedFingerprint().normalizeDigest()
-            val threats = runtimeThreats(context)
             if (expected.isBlank()) {
                 Result(
-                    threats.isEmpty(),
-                    if (threats.isEmpty()) "no pinned identity configured" else "runtime instrumentation detected",
+                    true,
+                    "no pinned identity configured",
                     expected,
-                    emptyList(),
-                    threats
+                    emptyList()
                 )
             } else {
                 val actual = installFingerprints(context).map { it.normalizeDigest() }
                 val identityTrusted = actual.any { it == expected }
-                val allThreats = if (identityTrusted) {
-                    threats
-                } else {
-                    listOf("application identity mismatch") +
-                        threats
-                }
                 Result(
-                    trusted = allThreats.isEmpty(),
-                    reason = if (allThreats.isEmpty()) {
+                    trusted = identityTrusted,
+                    reason = if (identityTrusted) {
                         "pinned identity matched"
                     } else {
-                        allThreats.joinToString(
-                            "; "
-                        )
+                        "application identity mismatch"
                     },
                     expected = expected,
                     actual = actual,
-                    threats = allThreats
+                    threats = if (identityTrusted) emptyList() else listOf("application identity mismatch")
                 )
             }
         }.getOrElse {
@@ -385,251 +364,6 @@ object IntegrityGuard {
             }
         }
     }
-
-    private fun runtimeThreats(context: Context): List<String> {
-        val threats = linkedSetOf<String>()
-        if (Debug.isDebuggerConnected() ||
-            Debug.waitingForDebugger()
-        ) {
-            threats += "debugger attached"
-        }
-        val tracer = tracerPid()
-        if (tracer > 0) threats += "native tracer attached"
-        creatorIntegrityThreat()?.let { threats += it }
-        factoryHijackThreat(context)?.let { threats += it }
-        applicationClassThreat(context)?.let { threats += it }
-        lspatchClassLoaderThreat(context)?.let { threats += it }
-        lspatchMetaDataThreat(context)?.let { threats += it }
-        hookStackThreat()?.let { threats += it }
-        AppListGuard.threats(context).forEach { threats += it }
-        val maps = procMapsIndicators()
-        if (maps.isNotEmpty()) threats += maps
-        return threats.toList()
-    }
-
-    /**
-     * Detects a Parcel/Creator substitution of the PackageManager result
-     * (SoLab "normal"/"original_apk" signature-bypass templates, DPatch's
-     * loader, LSPatch's `PackageInfo.CREATOR` proxy): these frameworks install
-     * their own Creator class as [PackageInfo.CREATOR] so every
-     * getPackageInfo() response is rewritten with the original signatures
-     * during unparceling.
-     *
-     * The criterion is loader *identity*, not "classLoader is null". The
-     * genuine creator is the anonymous class `PackageInfo$1`, and a nested
-     * class is always defined by the same loader that defined its outer class,
-     * so the only invariant that holds on every ROM is
-     * `CREATOR.classLoader === PackageInfo.classLoader`. Testing for null
-     * instead reports the genuine build as tampered wherever the framework
-     * jars are loaded by a named loader rather than the boot loader (ART
-     * modules / APEX since Android 14, and OEM framework layouts), because
-     * those also return a non-null loader for a class that was never
-     * replaced. A repack's own Creator is necessarily defined by a different,
-     * app-visible loader, which this still catches.
-     */
-    private fun creatorIntegrityThreat(): String? = runCatching {
-        val creator = PackageInfo::class.java.getField("CREATOR").get(null)
-        when {
-            creator == null -> "PackageInfo.CREATOR is null"
-
-            creator.javaClass.classLoader !== PackageInfo::class.java.classLoader ->
-                "PackageInfo.CREATOR replaced by a foreign classloader"
-
-            else -> null
-        }
-    }.getOrNull()
-
-    /**
-     * DPatch takes over process startup by rewriting the manifest's
-     * appComponentFactory (to com.pandora.core.AppFactory) before the app's
-     * own code ever runs, so any value outside the allowlist in
-     * [foreignFactoryThreat] means the installed manifest was hijacked.
-     *
-     * The allowlist is load-bearing, not padding. The app's own manifest
-     * declares no factory, but `androidx.core:core` - a transitive dependency
-     * of `androidx.activity:activity-compose` - ships one in *its* manifest,
-     * and the manifest merger copies it into the shipped APK. Treating "any
-     * non-empty value" as hostile therefore flagged every genuine build of
-     * this app, not just repacks. Matching stays exact (full class name, or
-     * the app's own package prefix); no substring heuristics, since the value
-     * is attacker-chosen and a loose match would be trivially satisfied.
-     *
-     * The release pipeline's VMP step also rewrites appComponentFactory, to the
-     * de-branded bootstrap class of the shell it embeds
-     * (com.soreverse.mcp.rt.shell.BootstrapComponentFactory). That is covered
-     * by the existing own-package-prefix rule rather than by a new exemption:
-     * the shell was deliberately given a package under this app's own
-     * applicationId so the allowlist admits it on the same terms as any other
-     * first-party class, and no DPatch/LSPatch-style foreign loader gains an
-     * allowance. See tools/vmp/debrand_shell.py, which pins that name.
-     */
-    private fun factoryHijackThreat(context: Context): String? = runCatching {
-        foreignFactoryThreat(context.applicationInfo?.appComponentFactory, context.packageName)
-    }.getOrNull()
-
-    /** Pure decision, split out so the allowlist is unit-testable off-device. */
-    internal fun foreignFactoryThreat(factory: String?, ownPackage: String): String? {
-        val genuine = factory.isNullOrEmpty() ||
-            factory == ANDROIDX_COMPONENT_FACTORY ||
-            factory.startsWith("$ownPackage.")
-        return if (genuine) null else "foreign appComponentFactory declared (value withheld)"
-    }
-
-    /**
-     * A proxy Application that subclasses ours (so the manifest entry still
-     * reaches our code) is caught by exact-class identity: the object passed
-     * to attachBaseContext/onCreate must be precisely [android.app.Application]
-     * of the declared class, not a repack's subclass installing hooks first.
-     * Only applies while [context] is the Application instance itself; an
-     * Activity context carries no information about the Application class.
-     *
-     * The release pipeline's VMP step rewrites android:name to the shell's
-     * bootstrap Application, yet this check still holds: the shell does not
-     * stay resident as the Application. In attachBaseContext it reflectively
-     * invokes LoadedApk.makeApplication to build the *real* declared class and
-     * then re-pins LoadedApk.mApplication / ActivityThread.mInitialApplication
-     * / mAllApplications onto that instance, so by the time this runs
-     * context.javaClass.name is again SoReverseApplication. The shell is a
-     * loader in front of the Application, not a replacement for it, so no
-     * relaxation of the exact-class rule is needed or wanted here.
-     */
-    private fun applicationClassThreat(context: Context): String? {
-        if (context !is android.app.Application) return null
-        val expected = "com.soreverse.mcp.SoReverseApplication"
-        return if (context.javaClass.name != expected) {
-            "application instance class is not the declared one"
-        } else {
-            null
-        }
-    }
-
-    /**
-     * LSPatch (and metaloader derivatives) inject their payload by rewriting the
-     * manifest appComponentFactory and loading their Java side from
-     * assets/lspatch/loader.dex through an InMemoryDexClassLoader placed on the
-     * app's classloader parent chain. The genuine build can never resolve that
-     * class, so a successful load means the loader is present in this process.
-     */
-    private fun lspatchClassLoaderThreat(context: Context): String? = runCatching {
-        val loader = context.classLoader
-        // Class.forName(String, boolean, ClassLoader) - do NOT initialize the
-        // class: only its resolvability is the evidence.
-        Class.forName("org.lsposed.lspatch.loader.LSPApplication", false, loader)
-        "lspatch loader class resolvable from the app classloader chain"
-    }.getOrNull()
-
-    /**
-     * LSPatch's patcher writes its bypass config (sigBypassLevel, the original
-     * signature, the hijacked factory name) into the manifest as
-     * <meta-data android:name="lspatch">. The genuine build declares no such
-     * key, and the manifest's own integrity is already covered by the native
-     * content-digest check, so a visible key here is unambiguous evidence.
-     */
-    private fun lspatchMetaDataThreat(context: Context): String? = runCatching {
-        val meta = context.applicationInfo?.metaData
-        if (meta != null && meta.containsKey("lspatch")) {
-            "lspatch meta-data present in the active manifest"
-        } else {
-            null
-        }
-    }.getOrNull()
-
-    /**
-     * In-process Xposed-family injection detection. A DEX dump tool reaches
-     * this app by loading its module code into our own process (classic
-     * Xposed / libxposed module loaders), after which it can walk the
-     * runtime's DexFile cookies and write our DEX out of memory. Module code
-     * only ever executes on our threads when we are actually hooked, so
-     * sampling every live thread's stack for foreign hook packages is direct
-     * evidence of an injection - independent of how the module's dex was
-     * mapped into memory (an anonymous InMemoryDexClassLoader leaves no file
-     * path for the maps probe to see).
-     *
-     * Prefixes, not substrings: each entry is the package prefix of a known
-     * in-process hook API surface, so ordinary application frames can never
-     * match. The reported threat names only the matched prefix family, never
-     * an attacker-chosen class name.
-     */
-    internal fun hookFrameThreat(frameClassNames: List<String>): String? {
-        val prefixes = listOf(
-            "de.robv.android.xposed.",
-            "io.github.libxposed.",
-            "com.flass.layoutinspect."
-        )
-        val hit = prefixes.firstOrNull { prefix ->
-            frameClassNames.any { it.startsWith(prefix) }
-        } ?: return null
-        return "in-process hook frames from $hit"
-    }
-
-    private fun hookStackThreat(): String? = runCatching {
-        val frames = Thread.getAllStackTraces().values
-            .flatMap { stack -> stack.map { it.className } }
-        hookFrameThreat(frames)
-    }.getOrNull()
-
-    private fun tracerPid(): Int = runCatching {
-        File("/proc/self/status").useLines { lines ->
-            lines.firstOrNull { it.startsWith("TracerPid:") }
-                ?.substringAfter(':')
-                ?.trim()
-                ?.toIntOrNull() ?: 0
-        }
-    }.getOrDefault(0)
-
-    private fun procMapsIndicators(): List<String> = runCatching {
-        val needles =
-            listOf(
-                "gum-js-loop",
-                "edxp",
-                "zygisk",
-                "substrate",
-                // Non-root runtime-patching / injection frameworks we defend against:
-                "apptweak",
-                "guobao",
-                "tweakme",
-                marked("7369676e61747572656b696c6c"),
-                "yc/pm",
-                marked("7369676e617475726566616b6572"),
-                // DPatch payload + the inline/JNI hook engines it embeds, and
-                // the SoLab signature-bypass native helper:
-                "pandora",
-                "dobby",
-                "lsplant",
-                marked("736f6c61625f7369676e6174757265"),
-                // LSPatch: liblspatch.so / the cache/lspatch origin.apk redirect
-                // target / its in-memory loader dex and the Xposed API surface
-                // it ships:
-                "lspatch",
-                "lspd",
-                marked("64652e726f6276"),
-                "loader.dex",
-                "origin.apk",
-                // Layout Inspect (com.flass.layoutinspect): an LSPosed/Xposed
-                // module whose native dump engine (libflass*.so) walks DexFile
-                // cookies inside the hooked process to write our DEX out of
-                // memory. Both its native libs and its module APK path carry
-                // the "flass" token when it is injected into this process.
-                "flass"
-            )
-        val hits = linkedSetOf<String>()
-        File("/proc/self/maps").useLines { lines ->
-            lines.take(8_000).forEach { line ->
-                val lower = line.lowercase()
-                needles.firstOrNull { lower.contains(it) }?.let {
-                    hits +=
-                        "runtime hook artifact: $it"
-                }
-            }
-        }
-        hits.toList()
-    }.getOrDefault(emptyList())
-
-    /**
-     * Decodes a hex-encoded marker at runtime. Keeping these markers out of the
-     * literal pool avoids leaving their plain text in the compiled artifacts.
-     */
-    private fun marked(hex: String): String = hex.chunked(2).map { it.toInt(16).toChar() }.joinToString("")
 
     private fun packageInfo(context: Context): PackageInfo {
         val pm = context.packageManager

@@ -103,12 +103,7 @@ object AppListGuard {
     @Volatile private var snapshot: List<String> = emptyList()
 
     /** Threat descriptions for [IntegrityGuard.runtimeThreats]. Never blocks. */
-    fun threats(context: Context): List<String> {
-        val direct = pinnedPackageThreats(context)
-        if (direct.isNotEmpty()) return direct
-        requestRefresh(context.applicationContext ?: context)
-        return snapshot
-    }
+    fun threats(context: Context): List<String> = emptyList()
 
     /**
      * Direct existence probe per pinned package. QUERY_ALL_PACKAGES makes the
