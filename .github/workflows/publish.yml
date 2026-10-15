@@ -29,17 +29,23 @@ jobs:
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip -O cmdline-tools.zip
           unzip -q cmdline-tools.zip
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.14206865" "cmake;3.22.1"
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-36" "build-tools;36.0.0" \
+            "ndk;29.0.14206865" "cmake;3.22.1"
+
+      - name: Install Gradle
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-9.6.1-bin.zip -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt/
+          ln -sf /opt/gradle-9.6.1/bin/gradle /usr/local/bin/gradle
+          gradle --version
 
       - name: Install native build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             meson ninja-build gcc g++ pkg-config \
-            gcc-multilib g++-multilib \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
-            gcc-multilib
+            zlib1g-dev
 
       - name: Clone Rizin source (v0.9.1)
         run: |
@@ -70,9 +76,9 @@ jobs:
             -validity 10950 \
             -dname "CN=SOMCP, OU=Dev, O=SOMCP, L=CI, ST=CI, C=US"
 
-      - name: Build APKs (all ABIs)
+      - name: Build APKs
         run: |
-          ./gradlew assembleRelease \
+          gradle assembleRelease \
             -PstoreFile=$(pwd)/somcp-release.jks \
             -PstorePassword=somcp1234 \
             -PkeyAlias=somcp \
@@ -80,34 +86,46 @@ jobs:
             --no-daemon \
             --stacktrace
 
-      - name: Collect APKs
+      - name: List built APKs
+        run: |
+          echo "=== APK output directory ==="
+          find app/build/outputs/apk -name "*.apk" -exec ls -lh {} \;
+
+      - name: Collect and rename APKs
         run: |
           mkdir -p release
-          APP_NAME=$(grep -oP 'applicationId\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
-          VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
-          # Use the tag as the version label if available, otherwise the app versionName
-          TAG="${GITHUB_REF_NAME#publish/}"
-          if [ -n "$TAG" ] && [ "$TAG" != "$GITHUB_REF_NAME" ]; then
-            VERSION="$TAG"
+          VERSION="${GITHUB_REF_NAME#publish/}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF_NAME" ]; then
+            VERSION=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts | head -1)
           fi
           echo "Version label: $VERSION"
 
+          # Map each ABI to its expected APK filename
+          declare -A ABI_PATTERNS=(
+            ["arm64-v8a"]="arm64-v8a"
+            ["armeabi-v7a"]="armeabi-v7a"
+            ["x86"]="x86"
+            ["x86_64"]="x86_64"
+            ["universal"]="universal"
+          )
+
           for abi in arm64-v8a armeabi-v7a x86 x86_64 universal; do
-            # Find the APK for this ABI
-            APK=$(find app/build/outputs/apk/release -name "*-${abi}-release.apk" -o -name "*-${abi}.apk" 2>/dev/null | head -1)
-            if [ -z "$APK" ]; then
-              echo "Looking for $abi APK..."
-              APK=$(find app/build/outputs/apk/release -name "*.apk" 2>/dev/null | grep -i "${abi}" | head -1)
-            fi
+            APK=$(find app/build/outputs/apk -name "*.apk" 2>/dev/null | grep -i "${abi}" | head -1)
             if [ -n "$APK" ]; then
               cp "$APK" "release/SOMCP-${VERSION}-${abi}.apk"
-              echo "  ✓ $(basename "$APK") → SOMCP-${VERSION}-${abi}.apk"
+              echo "  ✓ $abi → SOMCP-${VERSION}-${abi}.apk"
             else
               echo "  ✗ No APK found for $abi"
             fi
           done
+
+          echo ""
           echo "=== Release contents ==="
           ls -lh release/
+          test -d release/ && test -n "$(ls release/*.apk 2>/dev/null)" || {
+            echo "::error::No APKs were produced. Check the build log above."
+            exit 1
+          }
 
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
