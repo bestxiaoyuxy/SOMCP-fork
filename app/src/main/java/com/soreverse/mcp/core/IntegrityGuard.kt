@@ -18,320 +18,49 @@ package com.soreverse.mcp.core
 
 import android.app.Activity
 import android.content.Context
-import android.content.pm.PackageInfo
-import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Process
-import com.soreverse.mcp.nativecore.NativeProbe
-import java.security.MessageDigest
-import kotlin.random.Random
 import kotlin.system.exitProcess
 
 object IntegrityGuard {
-    data class Result(val trusted: Boolean, val reason: String, val expected: String, val actual: List<String>, val threats: List<String> = emptyList())
-
-    @Volatile private var cached: Pair<Long, Result>? = null
-
-    private val scheduleLock = Any()
-
-    @Volatile private var recheckStarted = false
-
-    /** Failure recorded by [enforceEarly]; consumed (fail-closed) by [enforce]. */
-    @Volatile private var earlyNativeFailure: String? = null
+    data class Result(
+        val trusted: Boolean,
+        val reason: String,
+        val expected: String,
+        val actual: List<String>,
+        val threats: List<String> = emptyList()
+    )
 
     /**
-     * Startup enforcement failure. Surfaced by the UI gate (MainActivity's
-     * IntegrityGate dialog shows it with the triggering check or application
-     * named) instead of being killed on here: a kill inside
-     * Application.onCreate() runs before any UI exists, so the reason died
-     * with the in-memory AppLog and the launcher relaunched into the same
-     * silent kill - an undiagnosable reboot loop (observed on a HONOR LSA-AN00
-     * device where every start SIGKILLed itself ~1.2 s after launch with the
-     * native v3 verification passing). Fail-closed semantics are preserved:
-     * [inspect] short-circuits on this value, so the service/boot gates and
-     * the UI countdown exit all see an untrusted state until it is cleared.
-     */
-    @Volatile
-    var startupFailure: String? = null
-        private set
-
-    /**
-     * Runs all checks (Java PackageManager + native filesystem-level probe) and
-     * records [startupFailure] if any check fails; the UI gate renders the
-     * reason and exits after its countdown. Runtime tampering detected by the
-     * periodic recheck still terminates immediately.
-     *
-     * This is the main entry point for startup enforcement.
-     * It should be called once during Application.onCreate().
-     *
-     * The reason for two layers of checking:
-     * - Runtime patching tools replace the package metadata returned through
-     *   the Java PackageManager Binder interface, so a Java-level check alone
-     *   can be defeated.
-     * - The native probe reads the package file directly from the filesystem
-     *   and extracts the record embedded in the META-INF PKCS7 entry, a path
-     *   that a Binder-level replacement cannot reach.
-     * - Together they provide defense in depth: an attacker would have to
-     *   intervene in BOTH the Java PackageManager AND the native JNI bridge.
-     *
-     * Those same tools install their hook inside attachBaseContext(), so the
-     * native probe additionally runs from [enforceEarly] at that exact
-     * lifecycle point, and is repeated periodically at runtime so a one-shot or
-     * timing-based bypass does not survive past startup.
+     * No-op. All signature/identity/enforcement checks have been removed so
+     * that repackaged or modified builds can start without being blocked.
      */
     fun enforce(context: Context) {
-        // 0. Consume any failure the attachBaseContext-time gate recorded. It
-        //    was deliberately non-fatal there (no crash reporter yet), but it
-        //    is authoritative by the time onCreate runs: fail closed.
-        val earlyFailure = earlyNativeFailure
-        earlyNativeFailure = null
-
-        // 1. Java-level check (readable through the Binder interface)
-        val javaResult = inspect(context)
-        val javaPass = javaResult.trusted
-
-        // 2. Native-level check (reads the package file directly)
-        val nativePass = NativeProbe.matches(context)
-
-        // 2b. Native v2/v3 (Signing Block) identity check. Independently reads
-        //     the record stored in the v2/v3 block so a scheme-confusion repack
-        //     (preserved v1 entries + re-signed v2/v3) cannot pass the
-        //     filesystem-level v1 check.
-        val v234Pass = NativeProbe.matchesV234(context)
-
-        // 3. Native package-id pin (rejects repackaged builds that changed
-        //    applicationId, even if the Java layer reports a spoofed name).
-        val packagePass = NativeProbe.matchesId(context)
-
-        // 4. Native archive probe (ZIP structure + critical entries + dex CRC)
-        val probeCode = NativeProbe.probeArchive(context)
-        val probePass = probeCode == NativeProbe.ProbeCode.OK
-
-        // 5. Native cryptographic verification of the v2/v3 signature record.
-        //    Steps 2/2b only prove that the signing block *names* the pinned
-        //    signer: the block is a blob, so editing the file content and
-        //    leaving the original signature record (and the digests recorded in
-        //    it) in place passes both - it installs wherever the installer's own
-        //    signature verification is bypassed. This step verifies the
-        //    signature with the pinned signer's key and recomputes the signed
-        //    content digest, which rejects exactly that repack.
-        val blockCode = NativeProbe.verifyBlock(context)
-        val blockPass = !NativeProbe.isTamper(blockCode)
-
-        if (earlyFailure != null ||
-            !javaPass ||
-            !nativePass ||
-            !v234Pass ||
-            !packagePass ||
-            !probePass ||
-            !blockPass
-        ) {
-            val reasons = mutableListOf<String>()
-            if (earlyFailure != null) {
-                reasons.add("Early gate (attachBaseContext): $earlyFailure")
-            }
-            if (!javaPass) reasons.add("Java: ${javaResult.reason}")
-            if (!nativePass) {
-                reasons.add(
-                    "Native: build identity differs from the pinned one"
-                )
-            }
-            if (!v234Pass) {
-                reasons.add(
-                    "Native: v2/v3 identity record missing or mismatched"
-                )
-            }
-            if (!packagePass) {
-                reasons.add("Native: package id does not match the pinned value")
-            }
-            if (!probePass) {
-                reasons.add("Native: archive probe failed (code=0x${probeCode.toString(16)})")
-            }
-            if (!blockPass) {
-                reasons.add(
-                    "Native: v2/v3 signature or content digest mismatch " +
-                        "(code=0x${blockCode.toString(16)})"
-                )
-            }
-            AppLog.e("INTEGRITY ENFORCEMENT FAILED: ${reasons.joinToString("; ")}")
-            // Do NOT kill here. MainActivity is about to launch and its
-            // IntegrityGate dialog renders this reason (including which
-            // installed application tripped the coexistence gate) before the
-            // 10 s countdown exit; killing in onCreate() instead produced a
-            // silent relaunch loop with no evidence at all. The native
-            // crypto-verified tamper codes never reach this branch (they
-            // _exit(173) inside librz_native before returning), so the
-            // authoritative hard kill remains untouched.
-            startupFailure = reasons.joinToString("; ")
-            return
-        }
-
-        // 6. Keep re-checking at runtime so later tampering is caught.
-        schedulePeriodicRecheck(context.applicationContext ?: context)
+        // Intentionally empty — no integrity enforcement.
     }
 
     /**
-     * Lightweight early gate executed from Application.attachBaseContext().
-     * Only the native filesystem-level checks run here (identity digest,
-     * package-id pin, archive probe): reading the package file directly
-     * bypasses the Binder-level replacement that runtime patching tools install
-     * at exactly this lifecycle point.
-     *
-     * NOTE: this gate is NON-FATAL on failure. At attachBaseContext() the app
-     * has neither initialized AppLog nor installed CrashReporter, so a hard
-     * kill (Process.killProcess) here produced no diagnosable evidence and
-     * reboot-looped the app on any transient or false mismatch - the root cause
-     * of the startup-crash issue. We therefore only record the mismatch here;
-     * the authoritative kill happens in Application.onCreate() via [enforce],
-     * which re-runs the same native checks after AppLog has been initialized
-     * and logs the exact reason before terminating. The failure is recorded in
-     * [earlyNativeFailure] so [enforce] cannot proceed past it even if the
-     * state is somehow transient (fail-closed accumulation).
+     * No-op. The early gate at attachBaseContext no longer performs any check.
      */
     fun enforceEarly(context: Context) {
-        val failures = mutableListOf<String>()
-        if (!NativeProbe.matches(context)) failures += "native identity"
-        if (!NativeProbe.matchesV234(context)) failures += "native v2/v3 identity"
-        if (!NativeProbe.matchesId(context)) failures += "package id pin"
-        val probeCode = NativeProbe.probeArchive(context)
-        if (probeCode != NativeProbe.ProbeCode.OK) {
-            failures += "archive probe (code=0x${probeCode.toString(16)})"
-        }
-        if (failures.isNotEmpty()) {
-            earlyNativeFailure = failures.joinToString("; ")
-            AppLog.w(
-                "INTEGRITY (early) $earlyNativeFailure mismatch detected; " +
-                    "deferring termination to onCreate (attachBaseContext has no crash reporter)"
-            )
-        }
+        // Intentionally empty — no early gate.
     }
 
     /**
-     * Schedules a randomized-interval background re-check. Using random delays
-     * makes a deterministic "bypass the startup check, then hook later" plan
-     * much harder to time accurately.
+     * Always returns a trusted result. No identity or threat checks are
+     * performed.
      */
-    private fun schedulePeriodicRecheck(context: Context) {
-        synchronized(scheduleLock) {
-            if (recheckStarted) return
-            recheckStarted = true
-        }
-        Thread({
-            var delay = 8_000L + Random.nextLong(12_000L)
-            while (!Thread.currentThread().isInterrupted) {
-                try {
-                    Thread.sleep(delay)
-                } catch (_: InterruptedException) {
-                    return@Thread
-                }
-                // The native probe is the trustworthy one; the Java read cannot
-                // be faked but can be intercepted, so it is cross-checked too.
-                val nativeOk = NativeProbe.matches(context)
-                val javaOk = inspect(context).trusted
-                val v234Ok = NativeProbe.matchesV234(context)
-                val packageOk = NativeProbe.matchesId(context)
-                val probeOk =
-                    NativeProbe.probeArchive(context) ==
-                        NativeProbe.ProbeCode.OK
-                // Signature + content-digest verification is the only check that
-                // notices content edited under a preserved signature record, so
-                // it runs on every re-check as well.
-                val blockOk = !NativeProbe.isTamper(NativeProbe.verifyBlock(context))
-                if (!nativeOk || !javaOk || !v234Ok || !packageOk || !probeOk || !blockOk) {
-                    AppLog.e("INTEGRITY PERIODIC CHECK FAILED: tampering detected at runtime")
-                    terminateWithContext(context)
-                    return@Thread
-                }
-                delay = 45_000L + Random.nextLong(90_000L)
-            }
-        }).apply {
-            isDaemon = true
-            name = "soreverse-integrity"
-            start()
-        }
-    }
-
-    fun inspect(context: Context): Result {
-        // A recorded startup enforcement failure is authoritative and sticky
-        // (fail-closed): every consumer of [inspect] - the UI gate, the MCP
-        // service gate, the boot receiver gate - must see the untrusted state
-        // until the reason is surfaced and the process exits.
-        startupFailure?.let { failure ->
-            // `expected` is the pinned digest, never null, but `actual` is: the
-            // UI renders "expected" against "actual" and an empty `actual` made
-            // a pure environment-threat failure read as an identity mismatch.
-            // Read the installed fingerprints here so the gate can show both
-            // sides and let the user see which one actually failed.
-            val actual = runCatching {
-                installFingerprints(context).map { it.normalizeDigest() }
-            }.getOrDefault(emptyList())
-            return Result(
-                false,
-                failure,
-                NativeProbe.pinnedFingerprint().normalizeDigest(),
-                actual
-            )
-        }
-        cached?.let { (time, result) ->
-            if (System.currentTimeMillis() - time < 2_000L) return result
-        }
-        val result = runCatching {
-            val expected = NativeProbe.pinnedFingerprint().normalizeDigest()
-            if (expected.isBlank()) {
-                Result(
-                    true,
-                    "no pinned identity configured",
-                    expected,
-                    emptyList()
-                )
-            } else {
-                val actual = installFingerprints(context).map { it.normalizeDigest() }
-                val identityTrusted = actual.any { it == expected }
-                Result(
-                    trusted = identityTrusted,
-                    reason = if (identityTrusted) {
-                        "pinned identity matched"
-                    } else {
-                        "application identity mismatch"
-                    },
-                    expected = expected,
-                    actual = actual,
-                    threats = if (identityTrusted) emptyList() else listOf("application identity mismatch")
-                )
-            }
-        }.getOrElse {
-            Result(
-                false,
-                it.message ?: it.javaClass.simpleName,
-                NativeProbe.pinnedFingerprint().normalizeDigest(),
-                emptyList()
-            )
-        }
-        cached = System.currentTimeMillis() to result
-        return result
-    }
+    fun inspect(context: Context): Result = Result(
+        trusted = true,
+        reason = "integrity checks disabled",
+        expected = "",
+        actual = emptyList()
+    )
 
     /**
-     * Gate used by the service and boot entry points.
-     *
-     * [inspect] alone reads the package metadata through PackageManager, which a
-     * runtime patching framework can substitute; the native identity checks read
-     * the package file itself, so they are required here too. The full
-     * cryptographic verification (with its content-digest pass over the whole
-     * file) is deliberately not part of this path - it runs at startup and on
-     * every periodic re-check.
+     * Always returns true. No native or Java identity checks are performed.
      */
-    fun isTrusted(context: Context): Boolean = inspect(context).trusted &&
-        runCatching {
-            NativeProbe.matches(context) &&
-                NativeProbe.matchesV234(context) &&
-                NativeProbe.matchesId(context)
-        }.getOrDefault(false)
+    fun isTrusted(context: Context): Boolean = true
 
-    /**
-     * Terminates the current process immediately. This is a hard kill that
-     * bypasses any Java-level exception handlers.
-     */
     fun terminateWithContext(context: Context) {
         try {
             if (context is Activity) {
@@ -347,35 +76,6 @@ object IntegrityGuard {
         runCatching { activity.finishAffinity() }
         exitProcess(173)
     }
-
-    private fun installFingerprints(context: Context): List<String> {
-        val info = packageInfo(context)
-        val certs = if (Build.VERSION.SDK_INT >= 28) {
-            val signingInfo = info.signingInfo ?: return emptyList()
-            val signers = if (signingInfo.hasMultipleSigners()) signingInfo.apkContentsSigners else signingInfo.signingCertificateHistory
-            signers.orEmpty().map { it.toByteArray() }
-        } else {
-            @Suppress("DEPRECATION")
-            info.signatures.orEmpty().map { it.toByteArray() }
-        }
-        return certs.map { bytes ->
-            MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") {
-                "%02X".format(it)
-            }
-        }
-    }
-
-    private fun packageInfo(context: Context): PackageInfo {
-        val pm = context.packageManager
-        return if (Build.VERSION.SDK_INT >= 28) {
-            pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
-        } else {
-            @Suppress("DEPRECATION")
-            pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNATURES)
-        }
-    }
-
-    private fun String.normalizeDigest(): String = normalizeFingerprint(this)
 }
 
 internal fun normalizeFingerprint(value: String): String = value.filter {
