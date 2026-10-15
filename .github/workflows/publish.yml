@@ -293,14 +293,13 @@ jobs:
 
       # --- Build APKs ---
       - name: Build APKs
+        env:
+          STORE_FILE: ${{ github.workspace }}/release/somcp-release.jks
+          STORE_PASSWORD: somcp1234
+          KEY_ALIAS: somcp
+          KEY_PASSWORD: somcp1234
         run: |
-          gradle assembleRelease \
-            -PstoreFile=$(pwd)/release/somcp-release.jks \
-            -PstorePassword=somcp1234 \
-            -PkeyAlias=somcp \
-            -PkeyPassword=somcp1234 \
-            --no-daemon \
-            --stacktrace
+          gradle assembleRelease --no-daemon --stacktrace
 
       - name: List built APKs
         run: |
