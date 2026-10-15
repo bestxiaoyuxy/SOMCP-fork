@@ -8,8 +8,16 @@ on:
 permissions:
   contents: write
 
+env:
+  NDK_VERSION: 29.0.14206865
+  RIZIN_VERSION: v0.9.1
+  CLOUDFLARED_TAG: "2026.8.3"
+
 jobs:
-  build-and-publish:
+  # ═══════════════════════════════════════════════════════════
+  # 1. Rizin + LIEF (most expensive: 8 large C/C++ cross-compiles)
+  # ═══════════════════════════════════════════════════════════
+  build-rizin-lief:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,36 +25,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - uses: actions/setup-java@v6
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      # --- Reusable fixed signing keystore (cached across runs) ---
-      - name: Restore fixed keystore from cache
-        uses: actions/cache/restore@v4
-        with:
-          path: release/somcp-release.jks
-          key: somcp-fixed-keystore-v1
-          lookup-only: false
-
-      - name: Generate keystore if not cached
-        if: hashFiles('release/somcp-release.jks') == ''
-        run: |
-          mkdir -p release
-          keytool -genkeypair \
-            -keystore release/somcp-release.jks \
-            -alias somcp \
-            -storepass somcp1234 \
-            -keypass somcp1234 \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10950 \
-            -dname "CN=SOMCP, OU=Dev, O=SOMCP, L=CI, ST=CI, C=US"
-          echo "Generated new keystore (first run)."
-
-      # --- Android SDK ---
-      - name: Install Android SDK
+      - name: Install Android SDK + NDK
         run: |
           mkdir -p $ANDROID_HOME/cmdline-tools
           cd $ANDROID_HOME/cmdline-tools
@@ -55,77 +34,183 @@ jobs:
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
             "platforms;android-36" "build-tools;36.0.0" \
-            "ndk;29.0.14206865" "cmake;3.22.1"
+            "ndk;${{ env.NDK_VERSION }}" "cmake;3.22.1"
 
-      - name: Install Gradle
-        run: |
-          wget -q https://services.gradle.org/distributions/gradle-9.6.1-bin.zip -O /tmp/gradle.zip
-          unzip -q /tmp/gradle.zip -d /opt/
-          ln -sf /opt/gradle-9.6.1/bin/gradle /usr/local/bin/gradle
-          gradle --version
-
-      # --- Native build tools ---
       - name: Install native build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            meson ninja-build gcc g++ pkg-config \
-            zlib1g-dev
+            meson ninja-build gcc g++ pkg-config zlib1g-dev
 
-      # --- Rizin + LIEF ---
-      - name: Clone Rizin source (v0.9.1)
+      - name: Clone Rizin source
         run: |
           if [ ! -d third_party/rizin-src/librz/include ]; then
-            git clone --depth 1 --branch v0.9.1 https://github.com/rizinorg/rizin.git third_party/rizin-src
+            git clone --depth 1 --branch ${{ env.RIZIN_VERSION }} https://github.com/rizinorg/rizin.git third_party/rizin-src
           fi
 
-      - name: Build native backends (Rizin + LIEF)
+      - name: Cache Rizin + LIEF
+        uses: actions/cache@v4
+        with:
+          path: |
+            rizin-build
+            third_party/lief-build
+          key: rl-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}-${{ hashFiles('build-native-android.sh', 'rizin-cross-*.ini', 'rizin-native.ini') }}
+          restore-keys: |
+            rl-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}-
+
+      - name: Build Rizin + LIEF
         run: bash build-native-android.sh
 
-      # --- Unidbg natives ---
-      - name: Build Unidbg native libs (capstone/keystone/unicorn)
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rizin-lief
+          path: |
+            rizin-build
+            third_party/lief-build
+          retention-days: 1
+
+  # ═══════════════════════════════════════════════════════════
+  # 2. Unidbg natives (capstone / keystone / unicorn)
+  # ═══════════════════════════════════════════════════════════
+  build-unidbg:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Android SDK + NDK
+        run: |
+          mkdir -p $ANDROID_HOME/cmdline-tools
+          cd $ANDROID_HOME/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-36" "build-tools;36.0.0" \
+            "ndk;${{ env.NDK_VERSION }}" "cmake;3.22.1"
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build gcc g++ pkg-config zlib1g-dev
+
+      - name: Cache Unidbg jniLibs
+        uses: actions/cache@v4
+        with:
+          path: app/src/main/jniLibs
+          key: unidbg-${{ env.NDK_VERSION }}-${{ hashFiles('build-unidbg-native.sh') }}
+          restore-keys: |
+            unidbg-${{ env.NDK_VERSION }}-
+
+      - name: Build Unidbg natives
         run: |
           set -euo pipefail
-          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-            bash build-unidbg-native.sh --abi "$abi"
-          done
-          for abi in arm64-v8a x86_64; do
-            for lib in capstone keystone unicorn; do
-              test -f "app/src/main/jniLibs/$abi/lib$lib.so" || {
-                echo "::error::missing jniLibs/$abi/lib$lib.so"
-                exit 1
-              }
+          if [ -f "app/src/main/jniLibs/arm64-v8a/libcapstone.so" ] && \
+             [ -f "app/src/main/jniLibs/arm64-v8a/libkeystone.so" ] && \
+             [ -f "app/src/main/jniLibs/arm64-v8a/libunicorn.so" ] && \
+             [ -f "app/src/main/jniLibs/x86_64/libcapstone.so" ] && \
+             [ -f "app/src/main/jniLibs/x86_64/libkeystone.so" ] && \
+             [ -f "app/src/main/jniLibs/x86_64/libunicorn.so" ]; then
+            echo "Unidbg libs cached, skipping."
+          else
+            for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+              bash build-unidbg-native.sh --abi "$abi"
             done
-          done
-          echo "Unidbg native libs present."
+          fi
 
-      # --- rz-ghidra ---
-      - name: Build rz-ghidra plugin (libcore_ghidra.so)
+      - name: Upload jniLibs
+        uses: actions/upload-artifact@v4
+        with:
+          name: unidbg-jnilibs
+          path: app/src/main/jniLibs
+          retention-days: 1
+
+  # ═══════════════════════════════════════════════════════════
+  # 3. rz-ghidra plugin
+  # ═══════════════════════════════════════════════════════════
+  build-rzghidra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install Android SDK + NDK
+        run: |
+          mkdir -p $ANDROID_HOME/cmdline-tools
+          cd $ANDROID_HOME/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-36" "build-tools;36.0.0" \
+            "ndk;${{ env.NDK_VERSION }}" "cmake;3.22.1"
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build gcc g++ pkg-config zlib1g-dev
+
+      - name: Clone Rizin source
+        run: |
+          if [ ! -d third_party/rizin-src/librz/include ]; then
+            git clone --depth 1 --branch ${{ env.RIZIN_VERSION }} https://github.com/rizinorg/rizin.git third_party/rizin-src
+          fi
+
+      - name: Cache rz-ghidra
+        uses: actions/cache@v4
+        with:
+          path: |
+            rz-ghidra-build
+          key: rzgh-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}-${{ hashFiles('build-rz-ghidra-android.sh') }}
+          restore-keys: |
+            rzgh-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}-
+
+      - name: Build rz-ghidra
         run: bash build-rz-ghidra-android.sh
 
-      - name: Verify rz-ghidra in jniLibs
-        run: |
-          set -euo pipefail
-          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-            test -f "app/src/main/jniLibs/$abi/libcore_ghidra.so" || {
-              echo "::error::missing $abi/libcore_ghidra.so"
-              exit 1
-            }
-          done
-          echo "libcore_ghidra.so present for all ABIs."
+      - name: Upload libcore_ghidra
+        uses: actions/upload-artifact@v4
+        with:
+          name: rzghidra
+          path: app/src/main/jniLibs/*/libcore_ghidra.so
+          retention-days: 1
 
-      # --- cloudflared ---
-      - name: Set up Go
-        uses: actions/setup-go@v7
+  # ═══════════════════════════════════════════════════════════
+  # 4. cloudflared (Go cross-compile)
+  # ═══════════════════════════════════════════════════════════
+  build-cloudflared:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v7
         with:
           go-version: "stable"
-          cache: false
 
-      - name: Cross-compile cloudflared for Android
+      - name: Cache Go module cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            /go/pkg/mod
+          key: go-mod-${{ env.CLOUDFLARED_TAG }}
+          restore-keys: |
+            go-mod-
+
+      - name: Cross-compile cloudflared
         run: |
           set -euo pipefail
-          CLOUDFLARED_TAG="2026.8.3"
-          git clone --depth 1 --branch "$CLOUDFLARED_TAG" \
+          git clone --depth 1 --branch "${{ env.CLOUDFLARED_TAG }}" \
             https://github.com/cloudflare/cloudflared.git cloudflared-src
           (
             cd cloudflared-src
@@ -142,23 +227,150 @@ jobs:
               go build -trimpath -ldflags="-s -w" \
               -o ../libcloudflared-x86 ./cmd/cloudflared
           )
-          for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-            mkdir -p "app/src/main/jniLibs/$abi"
-            cp "libcloudflared-${abi}" "app/src/main/jniLibs/$abi/libcloudflared.so"
-            test -f "app/src/main/jniLibs/$abi/libcloudflared.so" || {
-              echo "::error::missing $abi/libcloudflared.so"
-              exit 1
-            }
-          done
-          echo "cloudflared cross-compiled and bundled."
 
-      # --- Blutter runners (best-effort) ---
+      - name: Upload cloudflared
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudflared
+          path: |
+            libcloudflared-arm64-v8a
+            libcloudflared-armeabi-v7a
+            libcloudflared-x86
+            libcloudflared-x86_64
+          retention-days: 1
+
+  # ═══════════════════════════════════════════════════════════
+  # 5. Blutter runners (best-effort)
+  # ═══════════════════════════════════════════════════════════
+  build-blutter:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
       - name: Build Blutter runners
-        continue-on-error: true
         run: |
           bash tools/blutter-matrix/build-blutter-runners.sh
 
-      # --- Build APKs ---
+      - name: Upload blutter
+        uses: actions/upload-artifact@v4
+        with:
+          name: blutter
+          path: |
+            app/src/main/assets/blutter/
+            app/src/main/jniLibs/*/libblutter_*.so
+          retention-days: 1
+
+  # ═══════════════════════════════════════════════════════════
+  # 6. ASSEMBLE: collect all artifacts → Gradle build → publish
+  # ═══════════════════════════════════════════════════════════
+  assemble-and-publish:
+    runs-on: ubuntu-latest
+    needs: [build-rizin-lief, build-unidbg, build-rzghidra, build-cloudflared, build-blutter]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # --- Fixed keystore ---
+      - name: Restore keystore
+        uses: actions/cache/restore@v4
+        with:
+          path: release/somcp-release.jks
+          key: somcp-fixed-keystore-v1
+
+      - name: Generate keystore if not cached
+        if: hashFiles('release/somcp-release.jks') == ''
+        run: |
+          mkdir -p release
+          keytool -genkeypair \
+            -keystore release/somcp-release.jks \
+            -alias somcp \
+            -storepass somcp1234 \
+            -keypass somcp1234 \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10950 \
+            -dname "CN=SOMCP, OU=Dev, O=SOMCP, L=CI, ST=CI, C=US"
+
+      # --- Android SDK ---
+      - name: Install Android SDK
+        run: |
+          mkdir -p $ANDROID_HOME/cmdline-tools
+          cd $ANDROID_HOME/cmdline-tools
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "platforms;android-36" "build-tools;36.0.0" \
+            "ndk;${{ env.NDK_VERSION }}" "cmake;3.22.1"
+
+      - name: Install Gradle
+        run: |
+          wget -q https://services.gradle.org/distributions/gradle-9.6.1-bin.zip -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /opt/
+          ln -sf /opt/gradle-9.6.1/bin/gradle /usr/local/bin/gradle
+
+      # --- Download all parallel build artifacts ---
+      - name: Download Rizin + LIEF
+        uses: actions/download-artifact@v4
+        with:
+          name: rizin-lief
+
+      - name: Download Unidbg jniLibs
+        uses: actions/download-artifact@v4
+        with:
+          name: unidbg-jnilibs
+          path: app/src/main/jniLibs
+
+      - name: Download rz-ghidra
+        uses: actions/download-artifact@v4
+        with:
+          name: rzghidra
+          path: app/src/main/jniLibs
+
+      - name: Download cloudflared
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudflared
+          path: /tmp/cloudflared
+
+      - name: Install cloudflared into jniLibs
+        run: |
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            mkdir -p "app/src/main/jniLibs/$abi"
+            cp "/tmp/cloudflared/libcloudflared-${abi}" "app/src/main/jniLibs/$abi/libcloudflared.so"
+          done
+          echo "cloudflared installed."
+
+      # Blutter is best-effort — skip if artifact missing
+      - name: Download blutter (optional)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: blutter
+          path: app/src/main
+
+      # --- Cache Gradle ---
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: .gradle
+          key: gradle-${{ hashFiles('app/build.gradle.kts', 'build.gradle.kts') }}
+          restore-keys: |
+            gradle-
+
+      # --- Build ---
       - name: Build APKs
         run: |
           gradle assembleRelease \
