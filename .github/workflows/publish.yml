@@ -131,6 +131,16 @@ jobs:
           restore-keys: |
             go-mod-
 
+      - name: Cache blutter
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/src/main/jniLibs/*/libblutter_*.so
+            app/src/main/assets/blutter
+          key: blutter-${{ hashFiles('tools/blutter-matrix/build-blutter-runners.sh') }}
+          restore-keys: |
+            blutter-
+
       - name: Cache Gradle build
         uses: actions/cache@v4
         with:
@@ -227,7 +237,12 @@ jobs:
           # blutter (best-effort, no deps)
           (
             set -euo pipefail
-            bash tools/blutter-matrix/build-blutter-runners.sh
+            if [ -f "app/src/main/jniLibs/arm64-v8a/libblutter_5e4949e6decb093d82c1.so" ] && \
+               [ -f "app/src/main/assets/blutter/runners.json" ]; then
+              echo "blutter cached, skipping."
+            else
+              bash tools/blutter-matrix/build-blutter-runners.sh
+            fi
           ) > /tmp/build-blutter.log 2>&1 &
           BLUTTER_PID=$!
 
