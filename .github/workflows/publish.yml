@@ -47,8 +47,11 @@ jobs:
             android-sdk-
 
       - name: Install Android SDK
-        if: hashFiles('${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}/source.properties') == ''
         run: |
+          if [ -f "$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}/source.properties" ]; then
+            echo "Android SDK NDK already present, skipping install."
+            exit 0
+          fi
           mkdir -p $ANDROID_HOME/cmdline-tools
           cd $ANDROID_HOME/cmdline-tools
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip -O cmdline-tools.zip
@@ -68,8 +71,12 @@ jobs:
             gradle-dist-
 
       - name: Install Gradle
-        if: hashFiles('/opt/gradle-9.6.1/bin/gradle') == ''
         run: |
+          if [ -f /opt/gradle-9.6.1/bin/gradle ]; then
+            echo "Gradle 9.6.1 already present, skipping install."
+            ln -sf /opt/gradle-9.6.1/bin/gradle /usr/local/bin/gradle
+            exit 0
+          fi
           wget -q https://services.gradle.org/distributions/gradle-9.6.1-bin.zip -O /tmp/gradle.zip
           unzip -q /tmp/gradle.zip -d /opt/
           ln -sf /opt/gradle-9.6.1/bin/gradle /usr/local/bin/gradle
