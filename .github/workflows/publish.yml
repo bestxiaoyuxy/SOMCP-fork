@@ -131,7 +131,10 @@ jobs:
             cp -r "/tmp/lief-build" third_party/
           fi
           rm -rf /tmp/rl-cache.tar.gz /tmp/rizin-build /tmp/lief-build
-          echo "Rizin+LIEF cache extracted."
+          # 验证提取成功（防静默失败）
+          test -f "rizin-build/arm64-v8a/librz/util/librz_util.a" || { echo "::error::Rizin cache corrupted: librz_util.a missing"; exit 1; }
+          test -f "third_party/lief-build/arm64-v8a/lib/libLIEF.a" || { echo "::error::LIEF cache corrupted: libLIEF.a missing"; exit 1; }
+          echo "Rizin+LIEF cache extracted and verified."
 
       # Unidbg .so（不在 git）
       - name: Restore Unidbg jniLibs
@@ -240,13 +243,13 @@ jobs:
               GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
                 go build -trimpath -ldflags="-s -w" \
                 -o ../libcloudflared-arm64-v8a ./cmd/cloudflared
-              GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 \
+              GOOS=android GOARCH=arm GOARM=7 CGO_ENABLED=0 \
                 go build -trimpath -ldflags="-s -w" \
                 -o ../libcloudflared-armeabi-v7a ./cmd/cloudflared
-              GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
+              GOOS=android GOARCH=amd64 CGO_ENABLED=0 \
                 go build -trimpath -ldflags="-s -w" \
                 -o ../libcloudflared-x86_64 ./cmd/cloudflared
-              GOOS=linux GOARCH=386 CGO_ENABLED=0 \
+              GOOS=android GOARCH=386 CGO_ENABLED=0 \
                 go build -trimpath -ldflags="-s -w" \
                 -o ../libcloudflared-x86 ./cmd/cloudflared
               cd ..
@@ -470,7 +473,10 @@ jobs:
           echo "Version: $VERSION"
 
           for abi in arm64-v8a armeabi-v7a x86 x86_64 universal; do
-            APK=$(find app/build/outputs/apk -name "*.apk" 2>/dev/null | grep -i "${abi}" | head -1)
+            # 优先按 ABI 目录匹配，避免 universal 误匹配
+            APK=$(find app/build/outputs/apk -path "*/$abi/*" -name "*.apk" 2>/dev/null | head -1)
+            [ -z "$APK" ] && APK=$(find app/build/outputs/apk -name "*${abi}*.apk" 2>/dev/null | grep -vi universal | head -1)
+            [ -z "$APK" ] && APK=$(find app/build/outputs/apk -name "*${abi}*.apk" 2>/dev/null | head -1)
             if [ -n "$APK" ]; then
               cp "$APK" "dist/SOMCP-${VERSION}-${abi}.apk"
               echo "  ✓ $abi → SOMCP-${VERSION}-${abi}.apk"
