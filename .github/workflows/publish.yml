@@ -27,60 +27,64 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
+          # 不设 cache: gradle，Gradle 依赖缓存由下面的 gradle-deps 缓存管理
 
-      # --- Fixed signing keystore (committed to repo, always available) ---
-      # release/somcp-release.jks 在 git 中，每次构建直接用同一个密钥
+      # --- Fixed signing keystore (committed to repo) ---
       - name: Verify keystore
         run: |
           ls -la release/somcp-release.jks
           keytool -list -keystore release/somcp-release.jks -storepass somcp1234
 
-      # --- Android SDK (cached, saves 5-10min) ---
-      # ANDROID_HOME 在 GitHub runner 上是 /usr/local/lib/android/sdk
-      - name: Cache Android SDK
-        uses: actions/cache@v4
+      # --- Android SDK: 只缓存我们额外装的组件 (NDK + cmake)，不缓存整个 SDK ---
+      # GitHub runner 预装了 platforms + build-tools，只缺 NDK 29 和 cmake
+      - name: Restore NDK + CMake cache
+        id: ndk-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
-            /usr/local/lib/android/sdk
-          key: android-sdk-${{ env.NDK_VERSION }}
+            /tmp/ndk-cache
+          key: ndk-${{ env.NDK_VERSION }}
           restore-keys: |
-            android-sdk-
+            ndk-
 
-      - name: Install Android SDK
+      - name: Install Android SDK (NDK + CMake)
         run: |
-          if [ -f "/usr/local/lib/android/sdk/ndk/${{ env.NDK_VERSION }}/source.properties" ]; then
-            echo "Android SDK NDK already present, skipping install."
+          # 从缓存恢复（如果命中）
+          if [ -f "/tmp/ndk-cache/ndk-${{ env.NDK_VERSION }}/source.properties" ]; then
+            echo "NDK restored from cache, copying to ANDROID_HOME..."
+            mkdir -p "$ANDROID_HOME/ndk"
+            cp -r "/tmp/ndk-cache/ndk-${{ env.NDK_VERSION }}" "$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}"
+            if [ -d "/tmp/ndk-cache/cmake-3.22.1" ]; then
+              mkdir -p "$ANDROID_HOME/cmake"
+              cp -r "/tmp/ndk-cache/cmake-3.22.1" "$ANDROID_HOME/cmake/3.22.1"
+            fi
             exit 0
           fi
-          mkdir -p /usr/local/lib/android/sdk/cmdline-tools
-          cd /usr/local/lib/android/sdk/cmdline-tools
+          # 未命中：下载 cmdline-tools + 安装
+          mkdir -p $ANDROID_HOME/cmdline-tools
+          cd $ANDROID_HOME/cmdline-tools
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip -O cmdline-tools.zip
           unzip -q cmdline-tools.zip
-          yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager \
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
             "platforms;android-36" "build-tools;36.0.0" \
             "ndk;${{ env.NDK_VERSION }}" "cmake;3.22.1"
+          # 打包到缓存目录（只打包 NDK + cmake，不含 cmdline-tools/platforms）
+          mkdir -p /tmp/ndk-cache
+          cp -r "$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" /tmp/ndk-cache/ndk-${{ env.NDK_VERSION }}
+          cp -r "$ANDROID_HOME/cmake/3.22.1" /tmp/ndk-cache/cmake-3.22.1
 
-      # --- Gradle distribution (cached, saves 1-2min) ---
-      - name: Cache Gradle
-        uses: actions/cache@v4
+      - name: Save NDK + CMake cache
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
         with:
-          path: /opt/gradle-9.6.1
-          key: gradle-dist-9.6.1
-          restore-keys: |
-            gradle-dist-
+          path: /tmp/ndk-cache
+          key: ndk-${{ env.NDK_VERSION }}
 
-      - name: Install Gradle
-        run: |
-          if [ -f /opt/gradle-9.6.1/bin/gradle ]; then
-            echo "Gradle 9.6.1 already present, skipping install."
-            ln -sf /opt/gradle-9.6.1/bin/gradle /usr/local/bin/gradle
-            exit 0
-          fi
-          wget -q https://services.gradle.org/distributions/gradle-9.6.1-bin.zip -O /tmp/gradle.zip
-          unzip -q /tmp/gradle.zip -d /opt/
-          ln -sf /opt/gradle-9.6.1/bin/gradle /usr/local/bin/gradle
+      # --- Gradle: 用 gradle/actions/setup-gradle 统一管理发行版+依赖 ---
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.6.1'
 
       # --- Native build tools ---
       - name: Install native build tools
@@ -89,7 +93,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             meson ninja-build gcc g++ pkg-config zlib1g-dev
 
-      # --- Clone Rizin source (shared by Rizin build + rz-ghidra + CMake) ---
+      # --- Clone Rizin source ---
       - name: Clone Rizin source
         run: |
           if [ ! -d third_party/rizin-src/librz/include ]; then
@@ -97,12 +101,12 @@ jobs:
           fi
 
       # ═══════════════════════════════════════════════════════
-      # CACHES — 优化后总计 ~1.35GB（从 7.9GB 缩小 83%）
-      # Rizin+LIEF: 只打包 .a+头文件 → tar.gz (~800MB)
-      # 其他: 只缓存不在 git 里的产物
-      # key 只用版本号，避免 hashFiles 漂移
+      # CACHES — 统一用 restore + 条件 save（~4GB 总计）
       # ═══════════════════════════════════════════════════════
-      - name: Restore Rizin + LIEF cache (tar.gz)
+
+      # Rizin+LIEF: tar.gz 打包（.a+头文件，~800MB）
+      - name: Restore Rizin + LIEF cache
+        id: rl-cache
         uses: actions/cache/restore@v4
         with:
           path: /tmp/rl-cache.tar.gz
@@ -111,26 +115,28 @@ jobs:
             rl-tar-${{ env.NDK_VERSION }}-
 
       - name: Extract Rizin + LIEF cache
-        if: hashFiles('/tmp/rl-cache.tar.gz') != ''
+        id: rl-extract
+        if: steps.rl-cache.outputs.cache-hit == 'true'
         run: |
           echo "Extracting Rizin+LIEF cache..."
           tar -xzf /tmp/rl-cache.tar.gz -C /tmp/
-          # 移动到正确位置
           for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-            if [ -d "/tmp/rl-extract/rizin-build/$abi" ]; then
+            if [ -d "/tmp/rizin-build/$abi" ]; then
               mkdir -p rizin-build
-              cp -r "/tmp/rl-extract/rizin-build/$abi" rizin-build/
+              cp -r "/tmp/rizin-build/$abi" rizin-build/
             fi
           done
-          if [ -d "/tmp/rl-extract/lief-build" ]; then
+          if [ -d "/tmp/lief-build" ]; then
             mkdir -p third_party
-            cp -r "/tmp/rl-extract/lief-build" third_party/
+            cp -r "/tmp/lief-build" third_party/
           fi
-          rm -rf /tmp/rl-extract /tmp/rl-cache.tar.gz
+          rm -rf /tmp/rl-cache.tar.gz /tmp/rizin-build /tmp/lief-build
           echo "Rizin+LIEF cache extracted."
 
-      - name: Cache Unidbg jniLibs
-        uses: actions/cache@v4
+      # Unidbg .so（不在 git）
+      - name: Restore Unidbg jniLibs
+        id: unidbg-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             app/src/main/jniLibs/arm64-v8a/libcapstone.so
@@ -149,8 +155,10 @@ jobs:
           restore-keys: |
             unidbg-
 
-      - name: Cache rz-ghidra
-        uses: actions/cache@v4
+      # rz-ghidra .so（不在 git）
+      - name: Restore rz-ghidra
+        id: rzgh-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             app/src/main/jniLibs/arm64-v8a/libcore_ghidra.so
@@ -161,8 +169,10 @@ jobs:
           restore-keys: |
             rzgh-
 
-      - name: Cache cloudflared
-        uses: actions/cache@v4
+      # cloudflared .so（不在 git）
+      - name: Restore cloudflared
+        id: cf-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             app/src/main/jniLibs/arm64-v8a/libcloudflared.so
@@ -173,26 +183,33 @@ jobs:
           restore-keys: |
             cf-
 
-      - name: Cache Gradle build
-        uses: actions/cache@v4
+      # blutter（.so 在 git 里，但 runners.json 不在 → 缓存整个 blutter 目录）
+      - name: Restore blutter
+        id: blutter-cache
+        uses: actions/cache/restore@v4
         with:
-          path: .gradle
-          key: gradle-${{ hashFiles('app/build.gradle.kts', 'build.gradle.kts') }}
+          path: |
+            app/src/main/assets/blutter
+          key: blutter-v1
           restore-keys: |
-            gradle-
+            blutter-
 
       # ═══════════════════════════════════════════════════════
-      # PARALLEL BUILDS (all in same filesystem, no artifacts)
+      # PARALLEL BUILDS
       # ═══════════════════════════════════════════════════════
       - name: Parallel native builds (Rizin+LIEF, Unidbg, rz-ghidra, cloudflared)
         run: |
           set -uo pipefail
-          # Launch independent builds in background
-          # Rizin + LIEF (no deps)
-          bash build-native-android.sh > /tmp/build-rizin.log 2>&1 &
-          RIZIN_PID=$!
 
-          # Unidbg (no deps on Rizin)
+          # Rizin + LIEF (skip if cache hit)
+          if [ -f "rizin-build/arm64-v8a/librz/util/librz_util.a" ] && [ -f "third_party/lief-build/arm64-v8a/lib/libLIEF.a" ]; then
+            echo "Rizin+LIEF: cache hit, skipping compile."
+          else
+            bash build-native-android.sh > /tmp/build-rizin.log 2>&1 &
+            RIZIN_PID=$!
+          fi
+
+          # Unidbg
           (
             set -euo pipefail
             if [ -f "app/src/main/jniLibs/arm64-v8a/libcapstone.so" ] && \
@@ -210,7 +227,7 @@ jobs:
           ) > /tmp/build-unidbg.log 2>&1 &
           UNIDBG_PID=$!
 
-          # cloudflared (Go, no deps)
+          # cloudflared
           (
             set -euo pipefail
             if [ -f "app/src/main/jniLibs/arm64-v8a/libcloudflared.so" ] && \
@@ -241,16 +258,20 @@ jobs:
           ) > /tmp/build-cloudflared.log 2>&1 &
           CF_PID=$!
 
-          # Wait for Rizin+LIEF to finish (rz-ghidra depends on it)
-          echo "Waiting for Rizin+LIEF..."
-          wait $RIZIN_PID
-          RIZIN_EXIT=$?
-          if [ $RIZIN_EXIT -ne 0 ]; then
-            echo "=== Rizin+LIEF FAILED ==="
-            cat /tmp/build-rizin.log
-            exit 1
+          # Wait for Rizin+LIEF
+          if [ -n "${RIZIN_PID:-}" ]; then
+            echo "Waiting for Rizin+LIEF..."
+            wait $RIZIN_PID
+            RIZIN_EXIT=$?
+            if [ $RIZIN_EXIT -ne 0 ]; then
+              echo "=== Rizin+LIEF FAILED ==="
+              cat /tmp/build-rizin.log
+              exit 1
+            fi
+            echo "Rizin+LIEF done."
+          else
+            echo "Rizin+LIEF: skipped (cache hit)."
           fi
-          echo "Rizin+LIEF done."
 
           # rz-ghidra (needs Rizin SDK)
           (
@@ -266,7 +287,7 @@ jobs:
           ) > /tmp/build-rzghidra.log 2>&1 &
           RZGH_PID=$!
 
-          # blutter (best-effort, no deps)
+          # blutter (best-effort)
           (
             set -euo pipefail
             if [ -f "app/src/main/jniLibs/arm64-v8a/libblutter_5e4949e6decb093d82c1.so" ] && \
@@ -278,7 +299,7 @@ jobs:
           ) > /tmp/build-blutter.log 2>&1 &
           BLUTTER_PID=$!
 
-          # Wait for remaining builds
+          # Wait for remaining
           wait $UNIDBG_PID
           UNIDBG_EXIT=$?
           if [ $UNIDBG_EXIT -ne 0 ]; then
@@ -306,7 +327,6 @@ jobs:
           fi
           echo "rz-ghidra done."
 
-          # blutter is best-effort
           wait $BLUTTER_PID
           BLUTTER_EXIT=$?
           if [ $BLUTTER_EXIT -ne 0 ]; then
@@ -326,37 +346,6 @@ jobs:
               }
             done
           done
-
-          # Pack Rizin+LIEF for cache (only .a + headers, skip meson intermediates)
-          echo "=== Packing Rizin+LIEF cache ==="
-          if [ -d rizin-build ] || [ -d third_party/lief-build ]; then
-            mkdir -p /tmp/rl-extract
-            for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-              if [ -d "rizin-build/$abi" ]; then
-                mkdir -p "/tmp/rl-extract/rizin-build/$abi"
-                # Only copy .a files and include dirs (skip .o, meson-info, logs)
-                if [ -d "rizin-build/$abi/librz" ]; then
-                  cp -r "rizin-build/$abi/librz" "/tmp/rl-extract/rizin-build/$abi/"
-                fi
-                if [ -d "rizin-build/$abi/subprojects" ]; then
-                  # Copy subproject .a files and include dirs only
-                  find "rizin-build/$abi/subprojects" -name "*.a" -exec cp --parents {} "/tmp/rl-extract/rizin-build/$abi/" \;
-                  find "rizin-build/$abi/subprojects" -type d -name "include" -exec cp -r --parents {} "/tmp/rl-extract/rizin-build/$abi/" \;
-                fi
-              fi
-            done
-            if [ -d "third_party/lief-build" ]; then
-              mkdir -p /tmp/rl-extract/lief-build
-              for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-                if [ -f "third_party/lief-build/$abi/lib/libLIEF.a" ]; then
-                  mkdir -p "/tmp/rl-extract/lief-build/$abi/lib"
-                  cp "third_party/lief-build/$abi/lib/libLIEF.a" "/tmp/rl-extract/lief-build/$abi/lib/"
-                fi
-              done
-            fi
-            cd /tmp/rl-extract && tar -czf /tmp/rl-cache.tar.gz . && cd -
-            echo "Rizin+LIEF cache packed: $(du -sh /tmp/rl-cache.tar.gz | cut -f1)"
-          fi
           for abi in arm64-v8a armeabi-v7a x86 x86_64; do
             test -f "app/src/main/jniLibs/$abi/libcore_ghidra.so" || {
               echo "::error::missing $abi/libcore_ghidra.so"
@@ -369,14 +358,94 @@ jobs:
           done
           echo "All native libs verified."
 
-      # --- Build APKs ---
-      - name: Save Rizin + LIEF cache (tar.gz)
-        if: hashFiles('/tmp/rl-cache.tar.gz') != ''
+          # Pack Rizin+LIEF ONLY if we actually compiled (not cache hit)
+          if [ -n "${RIZIN_PID:-}" ]; then
+            echo "=== Packing Rizin+LIEF cache (fresh build) ==="
+            rm -rf /tmp/rl-pack && mkdir -p /tmp/rl-pack
+            for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+              if [ -d "rizin-build/$abi" ]; then
+                mkdir -p "/tmp/rl-pack/rizin-build/$abi"
+                if [ -d "rizin-build/$abi/librz" ]; then
+                  cp -r "rizin-build/$abi/librz" "/tmp/rl-pack/rizin-build/$abi/"
+                fi
+                if [ -d "rizin-build/$abi/subprojects" ]; then
+                  find "rizin-build/$abi/subprojects" -name "*.a" -exec cp --parents {} "/tmp/rl-pack/rizin-build/$abi/" \;
+                  find "rizin-build/$abi/subprojects" -type d -name "include" -exec cp -r --parents {} "/tmp/rl-pack/rizin-build/$abi/" \;
+                fi
+              fi
+            done
+            if [ -d "third_party/lief-build" ]; then
+              mkdir -p /tmp/rl-pack/lief-build
+              for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+                if [ -f "third_party/lief-build/$abi/lib/libLIEF.a" ]; then
+                  mkdir -p "/tmp/rl-pack/lief-build/$abi/lib"
+                  cp "third_party/lief-build/$abi/lib/libLIEF.a" "/tmp/rl-pack/lief-build/$abi/lib/"
+                fi
+              done
+            fi
+            cd /tmp/rl-pack && tar -czf /tmp/rl-cache.tar.gz . && cd -
+            echo "Rizin+LIEF cache packed: $(du -sh /tmp/rl-cache.tar.gz | cut -f1)"
+          else
+            echo "Rizin+LIEF cache hit — skipping pack (no re-upload)."
+          fi
+
+      # --- Save caches (only if we built them) ---
+      - name: Save Rizin + LIEF cache
+        if: steps.rl-cache.outputs.cache-hit != 'true' && hashFiles('/tmp/rl-cache.tar.gz') != ''
         uses: actions/cache/save@v4
         with:
           path: /tmp/rl-cache.tar.gz
           key: rl-tar-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}
 
+      - name: Save Unidbg cache
+        if: steps.unidbg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/src/main/jniLibs/arm64-v8a/libcapstone.so
+            app/src/main/jniLibs/arm64-v8a/libkeystone.so
+            app/src/main/jniLibs/arm64-v8a/libunicorn.so
+            app/src/main/jniLibs/armeabi-v7a/libcapstone.so
+            app/src/main/jniLibs/armeabi-v7a/libkeystone.so
+            app/src/main/jniLibs/armeabi-v7a/libunicorn.so
+            app/src/main/jniLibs/x86/libcapstone.so
+            app/src/main/jniLibs/x86/libkeystone.so
+            app/src/main/jniLibs/x86/libunicorn.so
+            app/src/main/jniLibs/x86_64/libcapstone.so
+            app/src/main/jniLibs/x86_64/libkeystone.so
+            app/src/main/jniLibs/x86_64/libunicorn.so
+          key: unidbg-${{ env.NDK_VERSION }}
+
+      - name: Save rz-ghidra cache
+        if: steps.rzgh-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/src/main/jniLibs/arm64-v8a/libcore_ghidra.so
+            app/src/main/jniLibs/armeabi-v7a/libcore_ghidra.so
+            app/src/main/jniLibs/x86/libcore_ghidra.so
+            app/src/main/jniLibs/x86_64/libcore_ghidra.so
+          key: rzgh-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}
+
+      - name: Save cloudflared cache
+        if: steps.cf-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            app/src/main/jniLibs/arm64-v8a/libcloudflared.so
+            app/src/main/jniLibs/armeabi-v7a/libcloudflared.so
+            app/src/main/jniLibs/x86/libcloudflared.so
+            app/src/main/jniLibs/x86_64/libcloudflared.so
+          key: cf-${{ env.CLOUDFLARED_TAG }}
+
+      - name: Save blutter cache
+        if: steps.blutter-cache.outputs.cache-hit != 'true' && hashFiles('app/src/main/assets/blutter/runners.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: app/src/main/assets/blutter
+          key: blutter-v1
+
+      # --- Build APKs ---
       - name: Build APKs
         env:
           STORE_FILE: ${{ github.workspace }}/release/somcp-release.jks
