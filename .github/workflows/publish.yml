@@ -36,8 +36,18 @@ jobs:
           ls -la release/somcp-release.jks
           keytool -list -keystore release/somcp-release.jks -storepass somcp1234
 
-      # --- Android SDK ---
+      # --- Android SDK (cached, saves 5-10min) ---
+      - name: Cache Android SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ANDROID_HOME }}
+          key: android-sdk-${{ env.NDK_VERSION }}
+          restore-keys: |
+            android-sdk-
+
       - name: Install Android SDK
+        if: hashFiles('${{ env.ANDROID_HOME }}/ndk/${{ env.NDK_VERSION }}/source.properties') == ''
         run: |
           mkdir -p $ANDROID_HOME/cmdline-tools
           cd $ANDROID_HOME/cmdline-tools
@@ -48,7 +58,17 @@ jobs:
             "platforms;android-36" "build-tools;36.0.0" \
             "ndk;${{ env.NDK_VERSION }}" "cmake;3.22.1"
 
+      # --- Gradle distribution (cached, saves 1-2min) ---
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: /opt/gradle-9.6.1
+          key: gradle-dist-9.6.1
+          restore-keys: |
+            gradle-dist-
+
       - name: Install Gradle
+        if: hashFiles('/opt/gradle-9.6.1/bin/gradle') == ''
         run: |
           wget -q https://services.gradle.org/distributions/gradle-9.6.1-bin.zip -O /tmp/gradle.zip
           unzip -q /tmp/gradle.zip -d /opt/
@@ -100,6 +120,26 @@ jobs:
           fi
           rm -rf /tmp/rl-extract /tmp/rl-cache.tar.gz
           echo "Rizin+LIEF cache extracted."
+
+      - name: Cache Unidbg jniLibs
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/src/main/jniLibs/arm64-v8a/libcapstone.so
+            app/src/main/jniLibs/arm64-v8a/libkeystone.so
+            app/src/main/jniLibs/arm64-v8a/libunicorn.so
+            app/src/main/jniLibs/armeabi-v7a/libcapstone.so
+            app/src/main/jniLibs/armeabi-v7a/libkeystone.so
+            app/src/main/jniLibs/armeabi-v7a/libunicorn.so
+            app/src/main/jniLibs/x86/libcapstone.so
+            app/src/main/jniLibs/x86/libkeystone.so
+            app/src/main/jniLibs/x86/libunicorn.so
+            app/src/main/jniLibs/x86_64/libcapstone.so
+            app/src/main/jniLibs/x86_64/libkeystone.so
+            app/src/main/jniLibs/x86_64/libunicorn.so
+          key: unidbg-${{ env.NDK_VERSION }}
+          restore-keys: |
+            unidbg-
 
       - name: Cache rz-ghidra
         uses: actions/cache@v4
