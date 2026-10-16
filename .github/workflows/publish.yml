@@ -106,17 +106,22 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            rz-ghidra-build
-            app/src/main/jniLibs/*/libcore_ghidra.so
-          key: rzgh-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}-${{ hashFiles('build-rz-ghidra-android.sh') }}
+            app/src/main/jniLibs/arm64-v8a/libcore_ghidra.so
+            app/src/main/jniLibs/armeabi-v7a/libcore_ghidra.so
+            app/src/main/jniLibs/x86/libcore_ghidra.so
+            app/src/main/jniLibs/x86_64/libcore_ghidra.so
+          key: rzgh-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}
           restore-keys: |
-            rzgh-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}-
+            rzgh-${{ env.NDK_VERSION }}-
 
       - name: Cache cloudflared
         uses: actions/cache@v4
         with:
           path: |
-            app/src/main/jniLibs/*/libcloudflared.so
+            app/src/main/jniLibs/arm64-v8a/libcloudflared.so
+            app/src/main/jniLibs/armeabi-v7a/libcloudflared.so
+            app/src/main/jniLibs/x86/libcloudflared.so
+            app/src/main/jniLibs/x86_64/libcloudflared.so
           key: cf-${{ env.CLOUDFLARED_TAG }}
           restore-keys: |
             cf-
