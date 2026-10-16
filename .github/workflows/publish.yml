@@ -29,25 +29,12 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      # --- Fixed signing keystore (reused across all runs) ---
-      - name: Restore keystore
-        uses: actions/cache/restore@v4
-        with:
-          path: release/somcp-release.jks
-          key: somcp-fixed-keystore-v1
-
-      - name: Generate keystore if not cached
-        if: hashFiles('release/somcp-release.jks') == ''
+      # --- Fixed signing keystore (committed to repo, always available) ---
+      # release/somcp-release.jks 在 git 中，每次构建直接用同一个密钥
+      - name: Verify keystore
         run: |
-          mkdir -p release
-          keytool -genkeypair \
-            -keystore release/somcp-release.jks \
-            -alias somcp \
-            -storepass somcp1234 \
-            -keypass somcp1234 \
-            -keyalg RSA -keysize 2048 \
-            -validity 10950 \
-            -dname "CN=SOMCP, OU=Dev, O=SOMCP, L=CI, ST=CI, C=US"
+          ls -la release/somcp-release.jks
+          keytool -list -keystore release/somcp-release.jks -storepass somcp1234
 
       # --- Android SDK ---
       - name: Install Android SDK
