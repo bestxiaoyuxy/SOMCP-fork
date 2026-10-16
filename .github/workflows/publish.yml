@@ -82,7 +82,9 @@ jobs:
           fi
 
       # ═══════════════════════════════════════════════════════
-      # CACHES (restore before build)
+      # CACHES — 缓存所有构建产物（总计 ~9.4GB < 10GB 限制）
+      # key 只用版本号（不用 hashFiles），避免文件变更导致 key 漂移
+      # actions/cache 默认行为：restore 命中 → Post 不保存（不覆盖）
       # ═══════════════════════════════════════════════════════
       - name: Cache Rizin + LIEF build
         uses: actions/cache@v4
@@ -90,17 +92,17 @@ jobs:
           path: |
             rizin-build
             third_party/lief-build
-          key: rl-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}-${{ hashFiles('build-native-android.sh', 'rizin-cross-*.ini', 'rizin-native.ini') }}
+          key: rl-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}
           restore-keys: |
-            rl-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}-
+            rl-${{ env.NDK_VERSION }}-
 
       - name: Cache Unidbg jniLibs
         uses: actions/cache@v4
         with:
           path: app/src/main/jniLibs
-          key: unidbg-${{ env.NDK_VERSION }}-${{ hashFiles('build-unidbg-native.sh') }}
+          key: unidbg-${{ env.NDK_VERSION }}
           restore-keys: |
-            unidbg-${{ env.NDK_VERSION }}-
+            unidbg-
 
       - name: Cache rz-ghidra
         uses: actions/cache@v4
@@ -112,7 +114,7 @@ jobs:
             app/src/main/jniLibs/x86_64/libcore_ghidra.so
           key: rzgh-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}
           restore-keys: |
-            rzgh-${{ env.NDK_VERSION }}-
+            rzgh-
 
       - name: Cache cloudflared
         uses: actions/cache@v4
@@ -140,9 +142,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            app/src/main/jniLibs/*/libblutter_*.so
+            app/src/main/jniLibs/arm64-v8a/libblutter_5e4949e6decb093d82c1.so
             app/src/main/assets/blutter
-          key: blutter-${{ hashFiles('tools/blutter-matrix/build-blutter-runners.sh') }}
+          key: blutter-v1
           restore-keys: |
             blutter-
 
