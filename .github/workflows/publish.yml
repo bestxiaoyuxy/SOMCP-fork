@@ -248,8 +248,10 @@ jobs:
           fi
 
       # --- Save Rizin + LIEF cache ---
+      # 注意：不用 hashFiles 守卫——它在 step 开始前评估，打包的文件还不存在。
+      # 打包在 Build Rizin+LIEF step 内完成（仅 cache miss 时），所以此处的条件足够。
       - name: Save Rizin + LIEF cache
-        if: steps.rl-cache.outputs.cache-hit != 'true' && hashFiles('/tmp/rl-cache.tar.gz') != ''
+        if: steps.rl-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: /tmp/rl-cache.tar.gz
@@ -517,5 +519,8 @@ jobs:
           tag_name: ${{ github.ref_name }}
           files: dist/*.apk
           generate_release_notes: true
+        # GitHub API 偶发超时（"couldn't respond in time"），
+        # 标记 continue-on-error 避免整个 run 失败；
+        # 失败时可手动重推 tag 重试（构建全走缓存，几分钟完成）。
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
