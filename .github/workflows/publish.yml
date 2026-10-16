@@ -198,172 +198,27 @@ jobs:
             blutter-
 
       # ═══════════════════════════════════════════════════════
-      # PARALLEL BUILDS
+      # PHASE 1: Rizin+LIEF (串行，~40min 编译 或 ~1min 缓存恢复)
       # ═══════════════════════════════════════════════════════
-      - name: Parallel native builds (Rizin+LIEF, Unidbg, rz-ghidra, cloudflared)
+      - name: Build Rizin + LIEF (serial, cached)
         run: |
           set -uo pipefail
-
-          # Rizin + LIEF (skip if cache hit)
           if [ -f "rizin-build/arm64-v8a/librz/util/librz_util.a" ] && [ -f "third_party/lief-build/arm64-v8a/lib/libLIEF.a" ]; then
             echo "Rizin+LIEF: cache hit, skipping compile."
           else
-            bash build-native-android.sh > /tmp/build-rizin.log 2>&1 &
-            RIZIN_PID=$!
-          fi
-
-          # Unidbg
-          (
-            set -euo pipefail
-            if [ -f "app/src/main/jniLibs/arm64-v8a/libcapstone.so" ] && \
-               [ -f "app/src/main/jniLibs/arm64-v8a/libkeystone.so" ] && \
-               [ -f "app/src/main/jniLibs/arm64-v8a/libunicorn.so" ] && \
-               [ -f "app/src/main/jniLibs/x86_64/libcapstone.so" ] && \
-               [ -f "app/src/main/jniLibs/x86_64/libkeystone.so" ] && \
-               [ -f "app/src/main/jniLibs/x86_64/libunicorn.so" ]; then
-              echo "Unidbg cached, skipping."
-            else
-              for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-                bash build-unidbg-native.sh --abi "$abi"
-              done
-            fi
-          ) > /tmp/build-unidbg.log 2>&1 &
-          UNIDBG_PID=$!
-
-          # cloudflared
-          (
-            set -euo pipefail
-            if [ -f "app/src/main/jniLibs/arm64-v8a/libcloudflared.so" ] && \
-               [ -f "app/src/main/jniLibs/x86_64/libcloudflared.so" ]; then
-              echo "cloudflared cached, skipping."
-            else
-              git clone --depth 1 --branch "${CLOUDFLARED_TAG}" \
-                https://github.com/cloudflare/cloudflared.git cloudflared-src
-              cd cloudflared-src
-              GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
-                go build -trimpath -ldflags="-s -w" \
-                -o ../libcloudflared-arm64-v8a ./cmd/cloudflared
-              GOOS=android GOARCH=arm GOARM=7 CGO_ENABLED=0 \
-                go build -trimpath -ldflags="-s -w" \
-                -o ../libcloudflared-armeabi-v7a ./cmd/cloudflared
-              GOOS=android GOARCH=amd64 CGO_ENABLED=0 \
-                go build -trimpath -ldflags="-s -w" \
-                -o ../libcloudflared-x86_64 ./cmd/cloudflared
-              GOOS=android GOARCH=386 CGO_ENABLED=0 \
-                go build -trimpath -ldflags="-s -w" \
-                -o ../libcloudflared-x86 ./cmd/cloudflared
-              cd ..
-              for abi in arm64-v8a armeabi-v7a x86_64 x86; do
-                mkdir -p "app/src/main/jniLibs/$abi"
-                cp "libcloudflared-${abi}" "app/src/main/jniLibs/$abi/libcloudflared.so"
-              done
-            fi
-          ) > /tmp/build-cloudflared.log 2>&1 &
-          CF_PID=$!
-
-          # Wait for Rizin+LIEF
-          if [ -n "${RIZIN_PID:-}" ]; then
-            echo "Waiting for Rizin+LIEF..."
-            wait $RIZIN_PID
+            echo "Rizin+LIEF: compiling (this takes ~40min)..."
+            bash build-native-android.sh > /tmp/build-rizin.log 2>&1
             RIZIN_EXIT=$?
             if [ $RIZIN_EXIT -ne 0 ]; then
               echo "=== Rizin+LIEF FAILED ==="
-              cat /tmp/build-rizin.log
+              tail -50 /tmp/build-rizin.log
               exit 1
             fi
-            echo "Rizin+LIEF done."
-          else
-            echo "Rizin+LIEF: skipped (cache hit)."
           fi
 
-          # rz-ghidra (needs Rizin SDK)
-          (
-            set -euo pipefail
-            if [ -f "app/src/main/jniLibs/arm64-v8a/libcore_ghidra.so" ] && \
-               [ -f "app/src/main/jniLibs/armeabi-v7a/libcore_ghidra.so" ] && \
-               [ -f "app/src/main/jniLibs/x86/libcore_ghidra.so" ] && \
-               [ -f "app/src/main/jniLibs/x86_64/libcore_ghidra.so" ]; then
-              echo "rz-ghidra cached, skipping."
-            else
-              bash build-rz-ghidra-android.sh
-            fi
-          ) > /tmp/build-rzghidra.log 2>&1 &
-          RZGH_PID=$!
-
-          # blutter (best-effort)
-          (
-            set -euo pipefail
-            if [ -f "app/src/main/jniLibs/arm64-v8a/libblutter_5e4949e6decb093d82c1.so" ] && \
-               [ -f "app/src/main/assets/blutter/runners.json" ]; then
-              echo "blutter cached, skipping."
-            else
-              bash tools/blutter-matrix/build-blutter-runners.sh
-            fi
-          ) > /tmp/build-blutter.log 2>&1 &
-          BLUTTER_PID=$!
-
-          # Wait for remaining
-          wait $UNIDBG_PID
-          UNIDBG_EXIT=$?
-          if [ $UNIDBG_EXIT -ne 0 ]; then
-            echo "=== Unidbg FAILED ==="
-            cat /tmp/build-unidbg.log
-            exit 1
-          fi
-          echo "Unidbg done."
-
-          wait $CF_PID
-          CF_EXIT=$?
-          if [ $CF_EXIT -ne 0 ]; then
-            echo "=== cloudflared FAILED ==="
-            cat /tmp/build-cloudflared.log
-            exit 1
-          fi
-          echo "cloudflared done."
-
-          wait $RZGH_PID
-          RZGH_EXIT=$?
-          if [ $RZGH_EXIT -ne 0 ]; then
-            echo "=== rz-ghidra FAILED ==="
-            cat /tmp/build-rzghidra.log
-            exit 1
-          fi
-          echo "rz-ghidra done."
-
-          wait $BLUTTER_PID
-          BLUTTER_EXIT=$?
-          if [ $BLUTTER_EXIT -ne 0 ]; then
-            echo "=== blutter FAILED (best-effort, continuing) ==="
-            cat /tmp/build-blutter.log
-          else
-            echo "blutter done."
-          fi
-
-          # Verify all outputs
-          echo "=== Verifying build outputs ==="
-          for abi in arm64-v8a x86_64; do
-            for lib in capstone keystone unicorn; do
-              test -f "app/src/main/jniLibs/$abi/lib$lib.so" || {
-                echo "::error::missing jniLibs/$abi/lib$lib.so"
-                exit 1
-              }
-            done
-          done
-          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-            test -f "app/src/main/jniLibs/$abi/libcore_ghidra.so" || {
-              echo "::error::missing $abi/libcore_ghidra.so"
-              exit 1
-            }
-            test -f "app/src/main/jniLibs/$abi/libcloudflared.so" || {
-              echo "::error::missing $abi/libcloudflared.so"
-              exit 1
-            }
-          done
-          echo "All native libs verified."
-
-          # Pack Rizin+LIEF ONLY if we actually compiled (not cache hit)
-          if [ -n "${RIZIN_PID:-}" ]; then
-            echo "=== Packing Rizin+LIEF cache (fresh build) ==="
+          # 打包缓存（只在 cache miss 时打包+上传）
+          if [ "${{ steps.rl-cache.outputs.cache-hit }}" != "true" ]; then
+            echo "=== Packing Rizin+LIEF cache ==="
             rm -rf /tmp/rl-pack && mkdir -p /tmp/rl-pack
             for abi in arm64-v8a armeabi-v7a x86 x86_64; do
               if [ -d "rizin-build/$abi" ]; then
@@ -392,7 +247,7 @@ jobs:
             echo "Rizin+LIEF cache hit — skipping pack (no re-upload)."
           fi
 
-      # --- Save caches (only if we built them) ---
+      # --- Save Rizin + LIEF cache ---
       - name: Save Rizin + LIEF cache
         if: steps.rl-cache.outputs.cache-hit != 'true' && hashFiles('/tmp/rl-cache.tar.gz') != ''
         uses: actions/cache/save@v4
@@ -400,6 +255,168 @@ jobs:
           path: /tmp/rl-cache.tar.gz
           key: rl-tar-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}
 
+      # ═══════════════════════════════════════════════════════
+      # PHASE 2: Unidbg + rz-ghidra + cloudflared + blutter (并行)
+      # ═══════════════════════════════════════════════════════
+      - name: Parallel builds (Unidbg, rz-ghidra, cloudflared, blutter)
+        run: |
+          set -uo pipefail
+
+          # Unidbg（build-unidbg-native.sh 内部按 ABI 隔离构建目录，无竞态）
+          (
+            set -uo pipefail
+            if [ -f "app/src/main/jniLibs/arm64-v8a/libcapstone.so" ] && \
+               [ -f "app/src/main/jniLibs/arm64-v8a/libkeystone.so" ] && \
+               [ -f "app/src/main/jniLibs/arm64-v8a/libunicorn.so" ] && \
+               [ -f "app/src/main/jniLibs/x86_64/libcapstone.so" ] && \
+               [ -f "app/src/main/jniLibs/x86_64/libkeystone.so" ] && \
+               [ -f "app/src/main/jniLibs/x86_64/libunicorn.so" ]; then
+              echo "Unidbg cached, skipping."
+            else
+              for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+                echo "=== Unidbg $abi ==="
+                if ! bash build-unidbg-native.sh --abi "$abi"; then
+                  echo "UNIDBG_FAIL=$abi"
+                  exit 1
+                fi
+              done
+            fi
+            echo "Unidbg OK"
+          ) > /tmp/build-unidbg.log 2>&1 &
+          UNIDBG_PID=$!
+
+          # rz-ghidra（Rizin+LIEF 已就绪）
+          (
+            set -uo pipefail
+            if [ -f "app/src/main/jniLibs/arm64-v8a/libcore_ghidra.so" ] && \
+               [ -f "app/src/main/jniLibs/armeabi-v7a/libcore_ghidra.so" ] && \
+               [ -f "app/src/main/jniLibs/x86/libcore_ghidra.so" ] && \
+               [ -f "app/src/main/jniLibs/x86_64/libcore_ghidra.so" ]; then
+              echo "rz-ghidra cached, skipping."
+            else
+              if ! bash build-rz-ghidra-android.sh; then
+                echo "RZGHIDRA_FAIL"
+                exit 1
+              fi
+            fi
+            echo "rz-ghidra OK"
+          ) > /tmp/build-rzghidra.log 2>&1 &
+          RZGH_PID=$!
+
+          # cloudflared（纯 Go，CGO_ENABLED=0，GOOS=android 需要 Go 1.21+）
+          (
+            set -uo pipefail
+            if [ -f "app/src/main/jniLibs/arm64-v8a/libcloudflared.so" ] && \
+               [ -f "app/src/main/jniLibs/x86_64/libcloudflared.so" ]; then
+              echo "cloudflared cached, skipping."
+            else
+              echo "go version: $(go version)"
+              git clone --depth 1 --branch "${CLOUDFLARED_TAG}" \
+                https://github.com/cloudflare/cloudflared.git cloudflared-src
+              cd cloudflared-src
+              GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
+                go build -trimpath -ldflags="-s -w" \
+                -o ../libcloudflared-arm64-v8a ./cmd/cloudflared
+              GOOS=android GOARCH=arm GOARM=7 CGO_ENABLED=0 \
+                go build -trimpath -ldflags="-s -w" \
+                -o ../libcloudflared-armeabi-v7a ./cmd/cloudflared
+              GOOS=android GOARCH=amd64 CGO_ENABLED=0 \
+                go build -trimpath -ldflags="-s -w" \
+                -o ../libcloudflared-x86_64 ./cmd/cloudflared
+              GOOS=android GOARCH=386 CGO_ENABLED=0 \
+                go build -trimpath -ldflags="-s -w" \
+                -o ../libcloudflared-x86 ./cmd/cloudflared
+              cd ..
+              for abi in arm64-v8a armeabi-v7a x86_64 x86; do
+                mkdir -p "app/src/main/jniLibs/$abi"
+                cp "libcloudflared-${abi}" "app/src/main/jniLibs/$abi/libcloudflared.so"
+              done
+            fi
+            echo "cloudflared OK"
+          ) > /tmp/build-cloudflared.log 2>&1 &
+          CF_PID=$!
+
+          # blutter (best-effort)
+          (
+            set -uo pipefail
+            if [ -f "app/src/main/jniLibs/arm64-v8a/libblutter_5e4949e6decb093d82c1.so" ] && \
+               [ -f "app/src/main/assets/blutter/runners.json" ]; then
+              echo "blutter cached, skipping."
+            else
+              if bash tools/blutter-matrix/build-blutter-runners.sh; then
+                echo "blutter OK"
+              else
+                echo "BLUTTER_FAIL (best-effort)"
+              fi
+            fi
+          ) > /tmp/build-blutter.log 2>&1 &
+          BLUTTER_PID=$!
+
+          # 收集并行结果（失败时输出完整日志）
+          FAILED=0
+
+          wait $UNIDBG_PID
+          if [ $? -ne 0 ]; then
+            echo "=== Unidbg FAILED (full log) ==="
+            cat /tmp/build-unidbg.log
+            FAILED=1
+          else
+            echo "Unidbg done."
+          fi
+
+          wait $CF_PID
+          if [ $? -ne 0 ]; then
+            echo "=== cloudflared FAILED (full log) ==="
+            cat /tmp/build-cloudflared.log
+            FAILED=1
+          else
+            echo "cloudflared done."
+          fi
+
+          wait $RZGH_PID
+          if [ $? -ne 0 ]; then
+            echo "=== rz-ghidra FAILED (full log) ==="
+            cat /tmp/build-rzghidra.log
+            FAILED=1
+          else
+            echo "rz-ghidra done."
+          fi
+
+          wait $BLUTTER_PID
+          if [ $? -ne 0 ]; then
+            echo "=== blutter FAILED (best-effort, continuing) ==="
+            cat /tmp/build-blutter.log
+          else
+            echo "blutter done."
+          fi
+
+          if [ $FAILED -ne 0 ]; then
+            exit 1
+          fi
+
+          # 验证产物
+          echo "=== Verifying build outputs ==="
+          for abi in arm64-v8a x86_64; do
+            for lib in capstone keystone unicorn; do
+              test -f "app/src/main/jniLibs/$abi/lib$lib.so" || {
+                echo "::error::missing jniLibs/$abi/lib$lib.so"
+                exit 1
+              }
+            done
+          done
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            test -f "app/src/main/jniLibs/$abi/libcore_ghidra.so" || {
+              echo "::error::missing $abi/libcore_ghidra.so"
+              exit 1
+            }
+            test -f "app/src/main/jniLibs/$abi/libcloudflared.so" || {
+              echo "::error::missing $abi/libcloudflared.so"
+              exit 1
+            }
+          done
+          echo "All native libs verified."
+
+      # --- Save other caches (only if we built them) ---
       - name: Save Unidbg cache
         if: steps.unidbg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
