@@ -37,27 +37,28 @@ jobs:
           keytool -list -keystore release/somcp-release.jks -storepass somcp1234
 
       # --- Android SDK (cached, saves 5-10min) ---
+      # ANDROID_HOME 在 GitHub runner 上是 /usr/local/lib/android/sdk
       - name: Cache Android SDK
         uses: actions/cache@v4
         with:
           path: |
-            ${{ env.ANDROID_HOME }}
+            /usr/local/lib/android/sdk
           key: android-sdk-${{ env.NDK_VERSION }}
           restore-keys: |
             android-sdk-
 
       - name: Install Android SDK
         run: |
-          if [ -f "$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}/source.properties" ]; then
+          if [ -f "/usr/local/lib/android/sdk/ndk/${{ env.NDK_VERSION }}/source.properties" ]; then
             echo "Android SDK NDK already present, skipping install."
             exit 0
           fi
-          mkdir -p $ANDROID_HOME/cmdline-tools
-          cd $ANDROID_HOME/cmdline-tools
+          mkdir -p /usr/local/lib/android/sdk/cmdline-tools
+          cd /usr/local/lib/android/sdk/cmdline-tools
           wget -q https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip -O cmdline-tools.zip
           unzip -q cmdline-tools.zip
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+          yes | /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          /usr/local/lib/android/sdk/cmdline-tools/latest/bin/sdkmanager \
             "platforms;android-36" "build-tools;36.0.0" \
             "ndk;${{ env.NDK_VERSION }}" "cmake;3.22.1"
 
