@@ -69,27 +69,37 @@ jobs:
           fi
 
       # ═══════════════════════════════════════════════════════
-      # CACHES — 缓存所有构建产物（总计 ~9.4GB < 10GB 限制）
-      # key 只用版本号（不用 hashFiles），避免文件变更导致 key 漂移
-      # actions/cache 默认行为：restore 命中 → Post 不保存（不覆盖）
+      # CACHES — 优化后总计 ~1.35GB（从 7.9GB 缩小 83%）
+      # Rizin+LIEF: 只打包 .a+头文件 → tar.gz (~800MB)
+      # 其他: 只缓存不在 git 里的产物
+      # key 只用版本号，避免 hashFiles 漂移
       # ═══════════════════════════════════════════════════════
-      - name: Cache Rizin + LIEF build
-        uses: actions/cache@v4
+      - name: Restore Rizin + LIEF cache (tar.gz)
+        uses: actions/cache/restore@v4
         with:
-          path: |
-            rizin-build
-            third_party/lief-build
-          key: rl-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}
+          path: /tmp/rl-cache.tar.gz
+          key: rl-tar-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}
           restore-keys: |
-            rl-${{ env.NDK_VERSION }}-
+            rl-tar-${{ env.NDK_VERSION }}-
 
-      - name: Cache Unidbg jniLibs
-        uses: actions/cache@v4
-        with:
-          path: app/src/main/jniLibs
-          key: unidbg-${{ env.NDK_VERSION }}
-          restore-keys: |
-            unidbg-
+      - name: Extract Rizin + LIEF cache
+        if: hashFiles('/tmp/rl-cache.tar.gz') != ''
+        run: |
+          echo "Extracting Rizin+LIEF cache..."
+          tar -xzf /tmp/rl-cache.tar.gz -C /tmp/
+          # 移动到正确位置
+          for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+            if [ -d "/tmp/rl-extract/rizin-build/$abi" ]; then
+              mkdir -p rizin-build
+              cp -r "/tmp/rl-extract/rizin-build/$abi" rizin-build/
+            fi
+          done
+          if [ -d "/tmp/rl-extract/lief-build" ]; then
+            mkdir -p third_party
+            cp -r "/tmp/rl-extract/lief-build" third_party/
+          fi
+          rm -rf /tmp/rl-extract /tmp/rl-cache.tar.gz
+          echo "Rizin+LIEF cache extracted."
 
       - name: Cache rz-ghidra
         uses: actions/cache@v4
@@ -114,26 +124,6 @@ jobs:
           key: cf-${{ env.CLOUDFLARED_TAG }}
           restore-keys: |
             cf-
-
-      - name: Cache Go module cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            /go/pkg/mod
-          key: go-mod-${{ env.CLOUDFLARED_TAG }}
-          restore-keys: |
-            go-mod-
-
-      - name: Cache blutter
-        uses: actions/cache@v4
-        with:
-          path: |
-            app/src/main/jniLibs/arm64-v8a/libblutter_5e4949e6decb093d82c1.so
-            app/src/main/assets/blutter
-          key: blutter-v1
-          restore-keys: |
-            blutter-
 
       - name: Cache Gradle build
         uses: actions/cache@v4
@@ -288,6 +278,37 @@ jobs:
               }
             done
           done
+
+          # Pack Rizin+LIEF for cache (only .a + headers, skip meson intermediates)
+          echo "=== Packing Rizin+LIEF cache ==="
+          if [ -d rizin-build ] || [ -d third_party/lief-build ]; then
+            mkdir -p /tmp/rl-extract
+            for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+              if [ -d "rizin-build/$abi" ]; then
+                mkdir -p "/tmp/rl-extract/rizin-build/$abi"
+                # Only copy .a files and include dirs (skip .o, meson-info, logs)
+                if [ -d "rizin-build/$abi/librz" ]; then
+                  cp -r "rizin-build/$abi/librz" "/tmp/rl-extract/rizin-build/$abi/"
+                fi
+                if [ -d "rizin-build/$abi/subprojects" ]; then
+                  # Copy subproject .a files and include dirs only
+                  find "rizin-build/$abi/subprojects" -name "*.a" -exec cp --parents {} "/tmp/rl-extract/rizin-build/$abi/" \;
+                  find "rizin-build/$abi/subprojects" -type d -name "include" -exec cp -r --parents {} "/tmp/rl-extract/rizin-build/$abi/" \;
+                fi
+              fi
+            done
+            if [ -d "third_party/lief-build" ]; then
+              mkdir -p /tmp/rl-extract/lief-build
+              for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+                if [ -f "third_party/lief-build/$abi/lib/libLIEF.a" ]; then
+                  mkdir -p "/tmp/rl-extract/lief-build/$abi/lib"
+                  cp "third_party/lief-build/$abi/lib/libLIEF.a" "/tmp/rl-extract/lief-build/$abi/lib/"
+                fi
+              done
+            fi
+            cd /tmp/rl-extract && tar -czf /tmp/rl-cache.tar.gz . && cd -
+            echo "Rizin+LIEF cache packed: $(du -sh /tmp/rl-cache.tar.gz | cut -f1)"
+          fi
           for abi in arm64-v8a armeabi-v7a x86 x86_64; do
             test -f "app/src/main/jniLibs/$abi/libcore_ghidra.so" || {
               echo "::error::missing $abi/libcore_ghidra.so"
@@ -301,6 +322,13 @@ jobs:
           echo "All native libs verified."
 
       # --- Build APKs ---
+      - name: Save Rizin + LIEF cache (tar.gz)
+        if: hashFiles('/tmp/rl-cache.tar.gz') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/rl-cache.tar.gz
+          key: rl-tar-${{ env.NDK_VERSION }}-${{ env.RIZIN_VERSION }}
+
       - name: Build APKs
         env:
           STORE_FILE: ${{ github.workspace }}/release/somcp-release.jks
