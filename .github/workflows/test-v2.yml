@@ -1,11 +1,8 @@
 name: Test v2
 
+# 见 test.yml：自动合并（GITHUB_TOKEN）不会触发 push 事件，由
+# pr-auto-review.yml 在合并后 dispatch 补触发。
 on:
-  push:
-    branches:
-      - main
-  # 见 test.yml：自动合并（GITHUB_TOKEN）不会触发 push 事件，由
-  # pr-auto-review.yml 在合并后 dispatch 补触发。
   workflow_dispatch:
 
 permissions:
@@ -17,7 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          # Why no native tree here: this Gradle-only job does reach
+          # third_party/ (preBuild -> buildUnidbgNative -> build-unidbg-native.sh),
+          # but that failure is downgraded to a warning by the Gradle task, so the
+          # job stays green with or without the submodules. Initialising them would
+          # only add minutes of cloning and put the job at the mercy of pins.
+          # The native jobs (build.yml, release.yml, test-v5..v11) init submodules
+          # via tools/init-submodules.sh and are the ones that gate on those libs.
+          submodules: false
+          fetch-depth: 0
       - uses: actions/setup-java@v6
         with:
           distribution: temurin

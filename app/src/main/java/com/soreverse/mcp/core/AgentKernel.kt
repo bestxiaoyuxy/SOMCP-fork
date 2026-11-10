@@ -50,6 +50,7 @@ internal object AgentKernel {
         .readTimeout(10, TimeUnit.MINUTES)
         .writeTimeout(120, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        .withCompromisedCaBlocklist()
         .build()
 
     fun engine(settings: SettingsStore): RikkaAgentEngine = RikkaAgentEngine(
@@ -60,7 +61,8 @@ internal object AgentKernel {
         model = settings.aiModel,
         temperature = settings.aiTemperature,
         customHeaders = stringMap(settings.aiCustomHeadersJson),
-        customBody = additionalBody(settings)
+        customBody = additionalBody(settings),
+        toolSchemaMode = settings.aiToolSchemaMode
     )
 
     /** The single prerequisite every agent path shares. */

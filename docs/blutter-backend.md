@@ -39,6 +39,90 @@ BlutterCoordinator
 
 每个隔离进程只执行一个作业。完成、取消、超时或崩溃后主进程解绑，服务进程退出，避免不同 Dart VM runner 的全局符号和状态在同一进程内共存。
 
+## 内存模型
+
+Dart VM 反序列化 `libapp.so` 快照时必须先建出完整对象图，这是格式层面的硬约束：输入侧不可能真正分块。因此主进程的内存策略不是「少读一点」，而是**让主进程根本不持有对象图**，并把其余每一步都做成与文件体积无关的形态。
+
+四级约束，按收益排序：
+
+1. **进程级隔离**。Dart 堆只存在于 `:blutter` 隔离进程。作业结束、取消或崩溃后进程退出，堆由内核直接回收，不经过主进程 GC，也不会因为一次分析把 UI 拖进 LMKD。
+2. **映射优先于读取**。ELF 解析不再 `readBytes()` 到堆，而是 `open → fstat → mmap(READ_ONLY) → close`，所有读取经由 `ByteView`（`FlutterByteScan.kt`）完成。file-backed 干净页在内存压力下可被内核直接丢弃；`read()` 产生的匿名脏页只能靠 swap 或杀进程回收。mmap 不可用时（部分 FUSE/SAF 挂载）才回退到整份读入，且先过 `MemoryGuard`。
+3. **APK 只读中央目录**。APK 普查走 `ZipFile` 条目表，不解压任何载荷；库提取走流式解压，单条目 64 KiB 缓冲，边写盘边算 SHA-256。摘要与「整份 `ByteArray` 求 SHA-256」字节等价，因此既有结果缓存键不失效。
+4. **尽早失败**。版本指纹（快照哈希、engine revision、Dart 版本、指针模式）在启动 runner 之前算完；不匹配直接返回 `UNSUPPORTED_FLUTTER_VERSION` 与可选覆盖提示，绝不进入隔离进程做无效建堆。
+
+### 对象图在哪里爆
+
+上面的四级约束全部作用在**主进程**，它们能让主进程的眼界与文件体积无关，但**不能改变隔离进程里 Dart VM 的峰值**。
+
+真正的峰值发生在 `:blutter` 隔离进程内：`libblutter_<key>.so` 的 `blutter_run_fd` 调 `DartApp app(path)`，Dart VM 反序列化 `libapp.so` 快照，把整个对象图建进**原生堆**（Dart heap，不是 ART 堆）。三层内存叠加：
+
+1. 快照文件本身；
+2. Dart 堆上的对象图（镜像指针表、Code、Pool、Object store 等，通常数倍于快照体积）；
+3. `CodeAnalyzer::AnalyzeAll()` 为每条指令建的反汇编器与 CFG 中间结构——这层是**上限项**，量级由函数数量 × 指令数决定，15 MB 快照很容易进入数百 MB 区间。
+
+`libapp.so` 体积与峰值**近似线性**，但真正决定成败的是 `libapp.so` 的**组成**：同样是 15 MB，塞满字符串的 `.rodata` 与塞满小函数的 `.text` 差距可能是数倍——后者才会让第 3 层爆炸。
+
+### 这不是「被内存闸门拒绝」
+
+`MemoryGuard` 只管主进程的 ART 堆：`ensureAnalysisMemory` 只出现在 APK 整份 `readFile` 的兜底路径（`inspect` / `analyze` 的 `workDirectory` 分支）和 `runner-result.json` 的解析校验处。走 `File` / APK 提取路径时 `libapp.so` 是通过 `ParcelFileDescriptor` 交给隔离进程的，**主进程闸门全程不参与**。所以 15 MB `libapp.so` 的失败不会得到 `INSUFFICIENT_MEMORY`。
+
+全部调用点一览（输入侧闸的是整份 `readFile`，结果侧闸的是 `org.json` 解析需要的「文本 + 对象树」两份）：
+
+| 调用点 | 闸的对象 | 所属阶段 |
+| --- | --- | --- |
+| `BlutterCoordinator.kt:98` | APK 整份 `readFile`，`inspect` 的 `workDirectory` 兜底 | 输入侧 |
+| `BlutterCoordinator.kt:365` | APK 整份 `readFile`，`analyze` 的 `workDirectory` 兜底 | 输入侧 |
+| `BlutterEmbeddedBackend.kt:164` | `runner-result.json` 的解析校验 | 结果侧 |
+| `BlutterResultStore.kt:201` | 读 blutter 结果文件前的闸门（`readResult`） | 结果侧 |
+
+四者都在主进程。输入侧只有「整份读入」这一条回退路径会过闸，`ParcelFileDescriptor` 路径不经过；结果侧两处都在解析 `runner-result.json` 之前，与本文件「结果侧闸门」一节同源。
+
+隔离进程侧的实际表现是可以区分的：
+
+| 现象 | 含义 |
+| --- | --- |
+| `RUNNER_NATIVE_FAILED` | `blutter_run_fd` 返回 6，即 `std::bad_alloc` / Dart VM 反序列化抛异常被 `catch` 捕获——**heap 分配失败** |
+| `RUNNER_INTERRUPTED` / `RUNNER_CRASHED` | 进程被 LMKD 或内核 OOM killer 杀掉，`onBindingDied` 触发 |
+| `INSUFFICIENT_MEMORY` | 只可能来自主进程侧闸门，与隔离进程无关 |
+
+如果 `libapp.so` 超过 256 MiB 会先撞 `INPUT_LIMIT_EXCEEDED`；15 MB 离这条线很远，不会是被输入限制拒绝。
+
+### 上限边界
+
+架构没有对 `libapp.so` 体积给硬上限（除了 256 MiB 的文件级限制），能跑多大完全取决于设备给 `:blutter` 进程的原生堆额度：ART 堆上限（`Runtime.maxMemory()`）、`ActivityManager.getMemoryClass()`、`isLowRamDevice` 与 `largeHeap` 都不影响 Dart VM 自己 malloc 出来的那部分，真正的天花板是设备可用 RAM 减去已用内存，通常在没有 swap 的 Android 上只有几百 MB 量级。
+
+`largeHeap` 未开启，`android:isolatedProcess="true"` 也不会放大额度。所以大 `libapp.so` 的可行区间是**设备相关**的，不能靠改配置抬高上限——这也是当前没有在文档里写「支持到 X MB」的原因：写不出一个诚实的固定数字。
+
+### 复现与确认
+
+`blutter_run_fd` 会把失败压成退出码，Kotlin 侧据此给出可区分的终态：
+
+```
+0  成功
+2  参数非法（fd < 0 或 cancellation 为空）
+3  取消 / 未产出结果
+5  写结果失败
+6  原生异常（std::bad_alloc、Dart VM 反序列化失败等）
+```
+
+需要实机确认峰值时，在分析进行中采样隔离进程的 VmRSS：
+
+```bash
+adb shell "while true; do grep VmRSS /proc/\$(pidof com.soreverse.mcp:blutter)/status; sleep 1; done"
+```
+
+### 结果侧闸门
+
+结果侧 `runner-result.json` 上限 512 MiB，解析前先 `MemoryGuard.ensureAnalysisMemory`（解析需要「文本 + 对象树」两份）；内存不足映射为 `INSUFFICIENT_MEMORY` 而非 `RUNNER_RESULT_INVALID`。分页响应改为对已解析对象的浅拷贝，不再整份序列化后重解析。这一层与上面隔离进程的原生堆峰值是两回事，不要混淆。
+
+实测对照（`-Xmx` 限制下的堆峰值，样本为真实 APK 与真实 `.so`）：
+
+| 场景 | 旧实现 | 新实现 |
+| --- | --- | --- |
+| 4.4 MB `libblutter_3_6.so`，`-Xmx512m` | 峰值 75 MiB | 峰值 4 MiB |
+| `.rodata` 33.1 MB 的 `libicudata.so`，`-Xmx128m` | OOM | 峰值 4 MiB |
+| 整包 43 MB APK，`-Xmx64m` | 峰值 57 MiB | 峰值 4 MiB |
+
 ## Runner 清单
 
 `app/src/main/assets/blutter/runners.json` 是 APK 能力的唯一事实来源：
@@ -73,6 +157,22 @@ indexed
 ```
 
 失败原因固定为 `source_unavailable`、`dartvm_compile_error`、`blutter_compile_error`、`android_cross_compile_error`、`android_icu_unavailable`、`android_capstone_unavailable`、`runner_crash`、`snapshot_mismatch`、`modified_engine` 或 `smoke_output_invalid`。未连接设备时不产生失败，只保留 `smokeStatus=not_run`。
+
+### 兼容键与匹配顺序
+
+清单为每个 runner 声明四个兼容键，它们的判定强度并不相同，匹配按此优先级打分：
+
+| 优先级 | 键 | 说明 |
+| --- | --- | --- |
+| 4 | 快照哈希 | Dart 快照格式真正绑定的键。一个哈希会被多个 engine revision 共享（Flutter 3.44.1–3.44.7 全部是 `ace654289f5abc240509fc941453ebc5`），因此这是唯一能识别「清单未枚举该 engine revision」的键。 |
+| 3 | engine revision | 匹配 `engineRevision` 或 `engineRevisions` 列表中的任意一项。 |
+| 1 | Dart 版本 | 最弱的信号，仅在没有更强证据时使用。 |
+
+指针模式（`compressedPointers`）、ABI 与 `analysis` 是硬前置条件，不参与打分：任一项不符即淘汰。全部键都不匹配时返回 `null`，调用方报不支持版本，绝不猜一个 VM 去反序列化异构快照。
+
+runner 的 `snapshotHashes` 由三部分并集而成：`snapshotAliases`、以及 `engineRevisions` 逐项在 `coverage` 表中反查到的 `snapshotHash`。反查这一步是关键——`coverage` 是唯一记录了「某 engine revision 实际发布哪个快照」的表，而 `snapshotAliases` 只包含构建者手工挑选的条目。
+
+拒绝时返回的错误体除 `supportedVersions` 外还带 `coverageHints`：从 `coverage` 中挑出与待分析指纹（engine revision / 快照哈希 / Dart 版本）命中的行，指出应当用哪个 Flutter 版本重建 runner，而不是只回一句「不支持」。
 
 ## 构建矩阵
 

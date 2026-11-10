@@ -2,7 +2,7 @@
 
 SOMCP 是一个运行在 Android 手机上的本地 SO 逆向 MCP 服务器。它通过 Streamable HTTP 暴露 MCP 工具，让客户端可以在手机上完成 ELF 结构分析、Rizin 反汇编/分析、LIEF ELF 修复/重写、补丁会话、构建导出、Cloudflare Tunnel 暴露和可选 APK MCP 桥接。
 
-当前版本：`1.0.22`（`app/build.gradle.kts` 的 `versionName`，`versionCode` 23）。已发布的正式产物见 [GitHub Releases](https://github.com/bilieebiliee1-design/SOMCP/releases)，两者不必同名：源码树里的版本可以领先于最近一次发布。
+当前版本：`1.0.23`（`app/build.gradle.kts` 的 `versionName`，`versionCode` 24）。已发布的正式产物见 [GitHub Releases](https://github.com/bilieebiliee1-design/SOMCP/releases)，两者不必同名：源码树里的版本可以领先于最近一次发布。
 
 包名：`com.soreverse.mcp`
 
@@ -73,13 +73,16 @@ Release 输出体积随原生后端更新变化，以 GitHub Release 资产页�
 - 加密字符串辅助解密（`strdecrypt_api`）：定位密文块、全量扫描 256 个单字节 XOR/add/sub/rol/ror 密钥并按可打印率排序，支持传入多字节 XOR / RC4 密钥试解。
 - 反调试/反 hook 扫描（`antidebug_api`）：按 import / string / code_pattern 三级证据分类，输出风险等级。
 - 导入符号溯源（`import_api`）：经 `.gnu.version_r` 把导入符号精确归属到源库，标注 Bionic 库用途。
+- 静态深度分析 AI（`static_analyze_ai`）：与 `dynamic_analyze_ai` 对等的静态入口，AI 在独立上下文自动驱动取证工具（`so_open → analyze_functions → … → analysis_report`）并输出结构化 Markdown 报告。
+- 应用日志远程读取（`system_logs`）：快照/过滤/清空应用内 500 行日志环形缓冲，远程排查工具错误不再依赖 App 日志页。
+- 工作区辅助（`workspace_overview` / `cache_clear` / `workspace_export`）：概要视图、引擎缓存清理、当前（含编辑会话）SO 字节 base64 导出（附 SHA-256 与架构）。
 - Cloudflare 永久隧道支持配置要展示的 HTTPS 公网地址；认证失败会停止重连并提示更新 token。
 - APK 内 SO 使用流式扫描与按需提取，分析页可一键释放工作区、索引缓存和已结束的 Blutter 数据。
 - 精简工具列表：默认暴露核心 + 网关（`lowlevel` 与 `agent`）+ meta 工具，完整能力通过 `meta_info(action=describe)` 发现。网关类不参与热度晋级——它们是入口而非证据调用，藏起来等于让对应能力不可达。
 
 ## MCP 工具体系
 
-当前共 46 个内置工具，准确数量以 `tools/list` 返回的 `_meta.fullToolCount` 为准；默认 lean 模式会广告核心、底层网关和 meta 工具，降低 LLM 初始化上下文成本。
+当前共 84 个内置工具，准确数量以 `tools/list` 返回的 `_meta.fullToolCount` 为准；默认 lean 模式会广告核心、底层网关和 meta 工具，降低 LLM 初始化上下文成本。
 
 推荐工作流：
 
@@ -162,14 +165,14 @@ agent_api(action=roles|run|capabilities, role=..., task=..., workspaceId=...)
 SOMCP 提供一套**独立**的动态分析工具流程，与静态 deep-analysis 循环彼此分离，把「把 `.so` 手动加载到内存 → 执行 → 采集证据 → 交给 AI 分析」串成一条可被 MCP 调用的链路。核心入口是两个工具：
 
 ```text
-dynamic_api(action=capabilities|dispatch|status|analyze, op=unidbg_session_open|unidbg_session_call|unidbg_session_registers|frida_hook|frida_call|analyze, backend=unidbg|frida, targetFunction=...)
+dynamic_api(action=capabilities|dispatch|status|analyze, op=unidbg_session_open|unidbg_session_call|unidbg_session_registers|frida_hook|frida_call|frida_read|frida_write|frida_replace|frida_modules|frida_script|analyze, backend=unidbg|frida, targetFunction=...)
 dynamic_analyze_ai(function=... | evidence=...)
 ```
 
 两个后端共用同一套编排层 `dynamicDispatch`：
 
 - **unidbg（模拟）**：`unidbg_session_open` 把选中的 `.so` 映射进模拟内存，`unidbg_session_call` 解析指定导出函数并执行，随后采集寄存器和目标地址的内存 dump。无需真机，适合快速验证目标函数行为。
-- **frida（真机 hook）**：`FridaBridge` 以纯 Kotlin 实现 `frida-server`/`frida-gadget` 的 TCP 协议客户端，`frida_hook` 通过 JS agent（Interceptor/Module）挂钩目标函数捕获入参与返回，`frida_call` 触发调用并回读 hook 结果。**注意**：`frida-server`/`frida-gadget` 不随 APK 内置，需在已 root 设备上单独安装并在推开时先对目标进程 `ptrace`/注入；未就绪时 `dynamic_api(action=capabilities)` 的 `status.fridaAvailable` 会如实标注 `false`，不会伪装成可用。
+- **frida（真机 hook）**：`FridaBridge` 以纯 Kotlin 实现 `frida-server`/`frida-gadget` 的 TCP 协议客户端，`frida_hook` 通过 JS agent（Interceptor/Module）挂钩目标函数捕获入参与返回，`frida_call` 触发调用并回读 hook 结果（参数支持 int、`0x…` 十六进制指针与自动 `allocUtf8String` 的字符串），`frida_write` 写内存、`frida_replace` 以 JS 片段替换函数实现、`frida_modules` 枚举已加载模块、`frida_script` 在 agent 内执行任意 JS。**注意**：`frida-server`/`frida-gadget` 不随 APK 内置，需在已 root 设备上单独安装并在推开时先对目标进程 `ptrace`/注入；未就绪时 `dynamic_api(action=capabilities)` 的 `status.fridaAvailable` 会如实标注 `false`，不会伪装成可用。
 
 `dynamic_analyze_ai` 复用 `RikkaAgentEngine`，把 `dynamicRun` 证据（寄存器现场、内存 dump、hook 记录、调用返回）喂给 AI 生成结构化动态分析报告：
 
@@ -183,6 +186,9 @@ dynamic_analyze_ai(function="JNI_OnLoad")  # 或直接传入上一步 evidence
 `meta_info(action=capabilities)` 的 `backends.dynamic` 是动态分析的能力真实面来源，明确列出 unidbg/frida 的支持状态与限制。
 
 `rizin_api(action=command)` 提供受控 Rizin raw command 通道，用于覆盖大量 Rizin 命令式底层能力；为安全起见，写入、文件、shell 等危险命令会被阻止。
+另外，`pdg` / `pdgo` / `pdgd` / `pdgx` 这四条反编译打印命令也会被拒绝，返回 `error.code=UNSAFE_DECOMPILER_PRINT`：它们走 Rizin 的注解代码打印器，会解引用一个本网关不持有的 console context（issue #37 的空指针崩溃）。
+被拒时改用 `rizin_api(action=decompile)` 取反编译代码，或在本命令通道里发 `pdgj`（同一份源码的 JSON）与 `pdg*`（注释命令）。
+行为变更：`action=decompile` 只在 `pdg` 与 `pdgj` 之间回落，不再回落到 `pdg*` / `pdd`；`pdgj` 的 JSON 里没有 `"code"` 字段时按“无输出”处理，并把其中的 `errors` 作为诊断原因带回。
 
 批量流水线支持事务模式：
 
@@ -250,7 +256,7 @@ agent_api(action=capabilities)           # supported / partial / not_covered，�
 - 工具暴露：lean tools、自适应 lean、禁用工具列表、工具结果字符上限、工具调用频率限制。
 - 性能保护：重型工具并发上限、请求超时、工具统计持久化。
 - 原生执行：Unidbg 模拟执行开关。
-- AI 深度分析：provider、API 地址、API Key、模型 ID（可从 `action=roles` 旁的端点拉取模型列表）、temperature、最大迭代、历史压缩阈值、自定义 headers/body、系统提示词。
+- AI 深度分析：provider、API 地址、API Key、模型 ID（可从 `action=roles` 旁的端点拉取模型列表）、temperature、最大迭代、历史压缩阈值、自定义 headers/body、系统提示词、工具调用模式（`full`=原生 Function Calling；`skills_like`=工具以 Skills 风格 Markdown 注入提示词、模型以 `<tool_call>` 标签调用，参考 AstrBot `tool_schema_mode`，省 token 且兼容不支持函数调用的端点，非法值回退 `full`）。
 - 子代理：启用开关、嵌套深度上限、单次会话派生配额、单子代理迭代上限、并发子代理数（详见「子代理」一节；凭据复用上面的 AI 配置，不单独设置）。
 - Blutter：查看内置 Flutter 3.44 / Dart 3.12.2 Runner、离线执行方式和精确兼容性规则。
 - Cloudflare Tunnel：quick/named、目标端口、协议、IP 版本、日志等级、keepalive、重连退避。
@@ -295,9 +301,29 @@ git clone https://github.com/rizinorg/rizin.git third_party/rizin-src
 （可选）构建 Unidbg 模拟后端所需的 Android 原生库（capstone/keystone/unicorn，默认不内置，详见“核心能力”中 Unidbg 说明）：
 
 ```powershell
-git submodule update --init --recursive
+# 子模块统一用脚本初始化（见下方说明），不要直接 git submodule update：
+# 嵌套 pin 若是上游已不存在的死提交，它只会回一句 upload-pack: not our ref。
+bash tools/init-submodules.sh
 .\build-unidbg-native.ps1
 ```
+
+> **`rizinorg/ghidra` 是会被清洗/重写历史的仓。** rz-ghidra 里 gitlink 记录的嵌套 pin
+> （`ghidra/ghidra`）因此可能变成上游不存在的死提交，此时
+> `git submodule update --init --recursive` 的表现就是 `upload-pack: not our ref`。
+> 按分支名取 + 本地校验 gitlink SHA 的写法并不放宽 pin：它把这类失败提前到有名字的检核点，
+> 并直接给出「抬 gitlink 或改 tag」的处置指引。注意区别——对**可达**提交，按裸 SHA 的
+> fetch 本身是通的（实测 `git fetch --depth 1 origin 3e5d774` 成功，非尖端的可达提交同样成功），
+> 失败只发生在提交已经不存在的时候。CI 的解法见 `.github/workflows/*` 里的 “Init submodules”
+> 步骤与 `tools/init-submodules.sh`——但只有真正产原生库的那几条（`build.yml`、`release.yml`、
+> `test-v5..v11`）会跑它；纯 Gradle 的 `test.yml` / `test-v2..v4` 不初始化子模块。要留意的是
+> 这四条并非「读不到 `third_party/`」：`preBuild` 依赖 `buildUnidbgNative`，它确实会调
+> `build-unidbg-native.sh`，而该脚本缺这些目录时会在**第一个 ABI 就 `exit 1`**，只是这份失败被
+> `app/build.gradle.kts:290` 的 `catch` 降级成 `:291-296` 的 warning，因此在那里初始化子模块
+> 换不到任何信号，只换来克隆耗时与无关红点。
+>
+> 置备只走这一个入口，不要再另外 `git clone` 一份 `third_party/rz-ghidra`：脚本会把它
+> reset 到父仓 gitlink，而嵌套 pin 读的是 rz-ghidra 自己的 HEAD，预克隆只会让目录在
+> 无声无息中停在别的提交上。
 
 构建 release：
 

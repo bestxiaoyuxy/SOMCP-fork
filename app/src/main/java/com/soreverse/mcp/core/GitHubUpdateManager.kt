@@ -53,9 +53,15 @@ data class GitHubRelease(
     val apkUrl: String,
     val apkSize: Long,
     val checksumUrl: String?,
-    /** Release publishtime (ISO-8601, UTC). "" when the API omitted it. Used to
-     *  tell a same-version republish apart from the build already installed. */
-    val publishedAt: String = ""
+    /** Release publishtime (ISO-8601, UTC). "" when the API omitted it.
+     *  No update decision reads it — it reaches GitHubUpdateManager
+     *  .isUpdateOfferable only so a future content-based signal can be threaded
+     *  in. It cannot tell a same-version republish apart either: every release
+     *  in this repo has publishedAt later than createdAt. */
+    val publishedAt: String = "",
+    /** Release-record creation time (ISO-8601, UTC). Falls back to
+     *  [publishedAt] when the API omitted it. Unread, like [publishedAt]. */
+    val createdAt: String = ""
 )
 
 sealed interface UpdateCheckResult {
@@ -91,6 +97,7 @@ class GitHubUpdateManager(private val context: Context) {
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        .withCompromisedCaBlocklist()
         .build()
     private val probeClient = client.newBuilder()
         .connectTimeout(4, TimeUnit.SECONDS)
@@ -127,7 +134,17 @@ class GitHubUpdateManager(private val context: Context) {
      *  automatic prompt also surfaces beta builds (a stable-only check misses
      *  every pre-release published after the latest stable). Per-channel manual
      *  checks (Settings > Updates) keep honouring the selected channel. A
-     *  channel that fails is ignored as long as the other yields a verdict. */
+     *  channel that fails is ignored as long as the other yields a verdict.
+     *
+     *  A final and a beta of the same core never reach the tie-break below:
+     *  compareVersions orders "v1.0.24-beta1" BELOW "v1.0.24", so the beta
+     *  loses on `order < 0`. The tie-break is entered only when
+     *  compareVersions reports the two tags fully equal, i.e. the same tag
+     *  recorded in both channels. There the stable channel's record is the one
+     *  this prompt should describe, so equal tags keep the first record seen
+     *  (stable is checked first) instead of picking by publishtime — a beta
+     *  re-publish can carry a later published_at without describing a
+     *  different build. */
     suspend fun checkAnyChannel(): Result<UpdateCheckResult> = withContext(Dispatchers.IO) {
         try {
             val releases = listOf(
@@ -141,7 +158,11 @@ class GitHubUpdateManager(private val context: Context) {
                 when {
                     order > 0 -> release
                     order < 0 -> acc
-                    else -> if (release.publishedAt > acc.publishedAt) release else acc
+                    // Equal ordering: keep acc rather than trading on
+                    // publishtime. String order is a no-op here (the tags are
+                    // equal by construction), so this just drops the old
+                    // publishedAt comparison.
+                    else -> acc
                 }
             }
             Result.success(newest?.let { UpdateCheckResult.Available(it) } ?: UpdateCheckResult.Current)
@@ -183,106 +204,17 @@ class GitHubUpdateManager(private val context: Context) {
         }
     }
 
-    /** Highest non-draft release of the requested prerelease state; ties
-     *  (same-version republish) break by publishtime. */
-    private fun newestRelease(array: JSONArray, prerelease: Boolean): JSONObject? {
-        var candidate: JSONObject? = null
-        var candidateTime = ""
-        for (index in 0 until array.length()) {
-            val release = array.getJSONObject(index)
-            if (release.optBoolean("draft") ||
-                release.optBoolean("prerelease") != prerelease
-            ) {
-                continue
-            }
-            val tag = release.optString("tag_name")
-            val published = release.optString("published_at")
-                .ifBlank { release.optString("created_at") }
-            val better = when {
-                candidate == null -> true
-                else -> when (val order = compareVersions(tag, candidate.optString("tag_name"))) {
-                    0 -> published > candidateTime
-                    else -> order > 0
-                }
-            }
-            if (better) {
-                candidate = release
-                candidateTime = published
-            }
-        }
-        return candidate
-    }
-
-    /** Semver-order comparison of two release tags: >0 if [left] is the
-     *  higher version, 0 if equal. Ordering: numeric core first, then the
-     *  pre-release suffix per semver (1.0.0-beta < 1.0.0, beta1 < beta2), so
-     *  a stale beta never outranks its own final release. Tags with no
-     *  numeric core rank below every versioned tag. */
-    private fun compareVersions(left: String, right: String): Int {
-        val a = versionParts(left)
-        val b = versionParts(right)
-        if (a.isEmpty() != b.isEmpty()) return if (a.isEmpty()) -1 else 1
-        compareCore(a, b)?.let { return it }
-        return comparePrerelease(prereleaseOf(left), prereleaseOf(right))
-    }
-
-    /** Component-wise core comparison, zero-padded; null when equal. */
-    private fun compareCore(left: List<Int>, right: List<Int>): Int? {
-        for (index in 0 until maxOf(left.size, right.size)) {
-            val comparison = (left.getOrNull(index) ?: 0).compareTo(right.getOrNull(index) ?: 0)
-            if (comparison != 0) return comparison
-        }
-        return null
-    }
-
-    /** Pre-release suffix (after the first '-', build metadata '+' dropped);
-     *  null for a clean release tag. */
-    private fun prereleaseOf(version: String): String? {
-        val core = version.trim().removePrefix("v").substringBefore('+')
-        val index = core.indexOf('-')
-        return if (index < 0) null else core.substring(index + 1)
-    }
-
-    /** Semver pre-release precedence: absent suffix outranks any; otherwise
-     *  dot-separated identifiers compare numerically / lexically, and the
-     *  shorter field-wise prefix is smaller (alpha < alpha.1). */
-    private fun comparePrerelease(left: String?, right: String?): Int = when {
-        left == null && right == null -> 0
-        left == null -> 1
-        right == null -> -1
-        else -> {
-            val l = left.split('.')
-            val r = right.split('.')
-            for (index in 0 until maxOf(l.size, r.size)) {
-                val li = l.getOrNull(index) ?: return -1
-                val ri = r.getOrNull(index) ?: return 1
-                val ln = li.toIntOrNull()
-                val rn = ri.toIntOrNull()
-                val comparison = when {
-                    ln != null && rn != null -> ln.compareTo(rn)
-                    ln != null -> -1
-                    rn != null -> 1
-                    else -> li.compareTo(ri)
-                }
-                if (comparison != 0) return comparison
-            }
-            0
-        }
-    }
-
-    /** Numeric core of a version tag: the dotted numbers before any
-     *  -suffix/+build. */
-    private fun versionParts(version: String): List<Int> = version.trim().removePrefix(
-        "v"
-    ).substringBefore('-').substringBefore('+').split('.').mapNotNull(String::toIntOrNull)
-
     private fun buildRelease(root: JSONObject, required: Boolean): UpdateCheckResult {
         val tag = root.optString("tag_name")
         val publishedAt = root.optString("published_at")
             .ifBlank { root.optString("created_at") }
-        if (!isUpdateOfferable(tag, publishedAt)) return UpdateCheckResult.Current
+        val createdAt = root.optString("created_at")
+            .ifBlank { publishedAt }
+        if (!isUpdateOfferable(tag, publishedAt, createdAt, BuildConfig.VERSION_NAME)) {
+            return UpdateCheckResult.Current
+        }
         val assets = root.optJSONArray("assets")
-        val apk = assets?.let { selectApk((0 until it.length()).map { index -> it.getJSONObject(index) }) }
+        val apk = assets?.let { selectApk((0 until it.length()).map { index -> it.getJSONObject(index) }, Build.SUPPORTED_ABIS) }
             ?: return if (required) error("Release has no APK for ${Build.SUPPORTED_ABIS.joinToString()}") else UpdateCheckResult.Current
         val checksum = (0 until assets.length())
             .map { assets.getJSONObject(it) }
@@ -302,7 +234,8 @@ class GitHubUpdateManager(private val context: Context) {
                 checksumUrl = checksum?.optString(
                     "browser_download_url"
                 )?.takeIf(String::isNotBlank),
-                publishedAt = publishedAt
+                publishedAt = publishedAt,
+                createdAt = createdAt
             )
         )
     }
@@ -551,45 +484,6 @@ class GitHubUpdateManager(private val context: Context) {
         return true
     }
 
-    private fun selectApk(assets: List<JSONObject>): JSONObject? {
-        val apks = assets.filter { it.optString("name").endsWith(".apk", true) }
-        val abiNames = Build.SUPPORTED_ABIS.flatMap { abi ->
-            listOf(abi.lowercase(), abi.lowercase().replace('-', '_'))
-        }
-        return apks.firstOrNull { asset ->
-            abiNames.any { it in asset.optString("name").lowercase() }
-        }
-            ?: apks.firstOrNull { "universal" in it.optString("name").lowercase() }
-            ?: apks.singleOrNull()
-    }
-
-    /** Whether the release [tag] (published at [publishedAt], ISO-8601 UTC)
-     *  should be offered as an update to this build.
-     *
-     *  Compares the NUMERIC CORE only against this APK's versionName (which
-     *  never carries a beta suffix): a higher core is always offered — that
-     *  covers both new stables and newer betas. Equal core is the
-     *  same-version case (republish, or beta1 -> beta2): offered only when
-     *  the release was published AFTER this APK's own release moment, which
-     *  the release workflow embeds via -PpublishedAt
-     *  (BuildConfig.RELEASE_PUBLISHED_AT). That single rule resolves the
-     *  users-indistinguishable-by-versionName dilemma: a stable 1.0.22 user
-     *  has embedded the final's publishtime, so the older beta 1.0.22-x
-     *  (published before it) is never offered; a beta1 user has beta1's
-     *  publishtime, so beta2 (published later) is offered. Dev/test builds
-     *  have no embedded moment and suppress equal-core offers entirely.
-     *  Lower core: never. ISO-8601 UTC strings sort lexicographically. */
-    private fun isUpdateOfferable(tag: String, publishedAt: String): Boolean {
-        val core = compareCore(versionParts(tag), versionParts(BuildConfig.VERSION_NAME))
-        return when {
-            core != null && core > 0 -> true
-            core != null -> false
-            else -> publishedAt.isNotBlank() &&
-                BuildConfig.RELEASE_PUBLISHED_AT.isNotBlank() &&
-                publishedAt > BuildConfig.RELEASE_PUBLISHED_AT
-        }
-    }
-
     private suspend fun verifyChecksum(file: File, url: String, assetName: String = file.name): String {
         var expected: String? = null
         var lastFailure: Throwable? = null
@@ -656,5 +550,185 @@ class GitHubUpdateManager(private val context: Context) {
     companion object {
         const val REPOSITORY_URL = "https://github.com/bilieebiliee1-design/SOMCP"
         private const val RELEASES_URL = "https://api.github.com/repos/bilieebiliee1-design/SOMCP/releases"
+
+        /** Highest non-draft release of the requested prerelease state; ties
+         *  (the same tag kept across a republish) break by record id, i.e. the
+         *  newest release record wins. Publishtime cannot order them: both
+         *  records of a recreated tag are published at their own build's end,
+         *  so a republish can sort below the record it replaced and the gate
+         *  would then judge the stale one. The id is monotonic per repository. */
+        internal fun newestRelease(array: JSONArray, prerelease: Boolean): JSONObject? {
+            var candidate: JSONObject? = null
+            for (index in 0 until array.length()) {
+                val release = array.getJSONObject(index)
+                if (release.optBoolean("draft") ||
+                    release.optBoolean("prerelease") != prerelease
+                ) {
+                    continue
+                }
+                val current = candidate
+                if (current == null) {
+                    candidate = release
+                    continue
+                }
+                val order = compareVersions(release.optString("tag_name"), current.optString("tag_name"))
+                // Same tag (a recreated record): the higher id is the record
+                // whose assets the release page currently serves.
+                val better = if (order != 0) order > 0 else release.optLong("id") > current.optLong("id")
+                if (better) candidate = release
+            }
+            return candidate
+        }
+
+        /** Whether the release [tag] should be offered as an update to the APK
+         *  built with [currentVersionName].
+         *
+         *  Offers a release only when [isNewerVersion] says it is strictly
+         *  higher than this APK's versionName. In practice versionName is a
+         *  bare "1.0.23" (no pre-release suffix is ever injected), so a
+         *  same-core release never clears the bar: beta1 -> beta2 and
+         *  beta -> final of one core are both suppressed, and only a HIGHER
+         *  core is offered. That is the point — a release carrying the version
+         *  this APK already runs is the same build, and offering it sends the
+         *  user off to reinstall the identical APK
+         *  ("已是最新版仍提示有最新版本").
+         *
+         *  Equal core used to be offered when the release looked republished,
+         *  detected as `published_at > created_at`. That signal is dead in this
+         *  repo's publishing pipeline: the release job creates the release
+         *  record when the tag build starts and attaches the assets when it
+         *  finishes, so EVERY release (all 22 of them, checked against the live
+         *  API) has published_at later than created_at. The condition was
+         *  therefore always true for the newest release and its own users were
+         *  prompted forever — and the test fixture that pinned this gate used
+         *  published_at == created_at, a shape no real release has ever had.
+         *
+         *  No replacement signal is needed for that: a same-core release can
+         *  never be identified as "newer than what is installed" from the
+         *  release record alone. There is no build instant in the APK to
+         *  compare against (deliberately — see the release workflow), and
+         *  versionName is not unique per artifact, so a republish of the same
+         *  version stays invisible to this gate. Users pick it up by checking
+         *  [publishedAt] and [createdAt] are therefore NOT read: they are
+         *  carried only so a future content-based signal (an artifact digest,
+         *  say) can be threaded in without touching call sites. Do not treat
+         *  them as live inputs. */
+        internal fun isUpdateOfferable(tag: String, publishedAt: String, createdAt: String, currentVersionName: String): Boolean =
+            isNewerVersion(tag, currentVersionName)
+
+        /** True when [tag] is a strictly higher version than [installedVersion]:
+         *  higher numeric core, or the same core with a higher pre-release
+         *  ordering (beta1 < beta2 < final). Equal or lower: false.
+         *
+         *  [installedVersion] is this build's versionName, so a final release
+         *  (no pre-release suffix) outranks every beta of the same core: a
+         *  stale beta is never pushed onto a stable user, and a stable user is
+         *  never moved off their own version. */
+        internal fun isNewerVersion(tag: String, installedVersion: String): Boolean = compareVersions(tag, installedVersion) > 0
+
+        /** Semver-order comparison of two release tags: >0 if [left] is the
+         *  higher version, 0 if equal. Ordering: numeric core first, then the
+         *  pre-release suffix per semver (1.0.0-beta < 1.0.0, beta1 < beta2), so
+         *  a stale beta never outranks its own final release. Tags with no
+         *  numeric core rank below every versioned tag. */
+        internal fun compareVersions(left: String, right: String): Int {
+            val a = versionParts(left)
+            val b = versionParts(right)
+            if (a.isEmpty() != b.isEmpty()) return if (a.isEmpty()) -1 else 1
+            compareCore(a, b)?.let { return it }
+            return comparePrerelease(prereleaseOf(left), prereleaseOf(right))
+        }
+
+        /** Pre-release suffix (after the first '-', build metadata '+' dropped);
+         *  null for a clean release tag. */
+        private fun prereleaseOf(version: String): String? {
+            val core = version.trim().removePrefix("v").substringBefore('+')
+            val index = core.indexOf('-')
+            return if (index < 0) null else core.substring(index + 1)
+        }
+
+        /** Semver pre-release precedence: absent suffix outranks any; otherwise
+         *  dot-separated identifiers compare numerically / lexically, and the
+         *  shorter field-wise prefix is smaller (alpha < alpha.1). */
+        internal fun comparePrerelease(left: String?, right: String?): Int = when {
+            left == null && right == null -> 0
+            left == null -> 1
+            right == null -> -1
+            else -> {
+                val l = left.split('.')
+                val r = right.split('.')
+                for (index in 0 until maxOf(l.size, r.size)) {
+                    val li = l.getOrNull(index) ?: return -1
+                    val ri = r.getOrNull(index) ?: return 1
+                    val ln = li.toIntOrNull()
+                    val rn = ri.toIntOrNull()
+                    val comparison = when {
+                        ln != null && rn != null -> ln.compareTo(rn)
+                        ln != null -> -1
+                        rn != null -> 1
+                        else -> li.compareTo(ri)
+                    }
+                    if (comparison != 0) return comparison
+                }
+                0
+            }
+        }
+
+        /** Numeric core of a version tag: the dotted numbers before any
+         *  -suffix/+build. */
+        internal fun versionParts(version: String): List<Int> = version.trim().removePrefix(
+            "v"
+        ).substringBefore('-').substringBefore('+').split('.').mapNotNull(String::toIntOrNull)
+
+        /** Component-wise core comparison, zero-padded; null when equal. */
+        internal fun compareCore(left: List<Int>, right: List<Int>): Int? {
+            for (index in 0 until maxOf(left.size, right.size)) {
+                val comparison = (left.getOrNull(index) ?: 0).compareTo(right.getOrNull(index) ?: 0)
+                if (comparison != 0) return comparison
+            }
+            return null
+        }
+
+        /** ABIs the release pipeline publishes as single-ABI splits (plus one
+         *  -universal.apk). Order is irrelevant; matching is exact-token. */
+        private val RELEASE_ABIS = listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
+
+        /** Picks the release asset matching the device's ABI, falling back to
+         *  the universal APK, then to a sole APK. Two properties matter:
+         *
+         *  1. Exact-token matching. A plain substring test mis-picks: "x86" is
+         *     contained in "x86_64", and the trailing "armeabi" of a 32-bit x86
+         *     device is contained in "armeabi-v7a" — an x86 device previously
+         *     downloaded the armeabi-v7a split (asset order is alphabetical)
+         *     instead of its own.
+         *  2. Device preference order. [abis] is [Build.SUPPORTED_ABIS]
+         *     (injected for tests): the first supported ABI with a matching
+         *     split wins, so an x86_64 device gets the x86_64 split even
+         *     though it also supports 32-bit x86 and the x86 split sorts
+         *     first alphabetically. */
+        internal fun selectApk(assets: List<JSONObject>, abis: Array<String>): JSONObject? {
+            val apks = assets.filter { it.optString("name").endsWith(".apk", true) }
+            val byAbi = apks.mapNotNull { asset ->
+                releaseAbiOf(asset.optString("name"))?.let { it to asset }
+            }.toMap()
+            return abis.firstNotNullOfOrNull { abi -> byAbi[abi.lowercase()] }
+                ?: apks.firstOrNull { "universal" in it.optString("name").lowercase() }
+                // Legacy single-APK releases carried no ABI token at all, and
+                // those are still installable everywhere. A lone *ABI-specific*
+                // split must NOT be used as a fallback: it is the wrong
+                // architecture for every other device, which is exactly the
+                // mis-download this selection was rewritten to stop.
+                ?: apks.singleOrNull()?.takeIf { releaseAbiOf(it.optString("name")) == null }
+        }
+
+        /** The ABI encoded in a release asset name, matched as a delimited
+         *  token (non-[a-z0-9_] on both sides) so "x86" never matches inside
+         *  "x86_64" and "armeabi" never matches inside "armeabi-v7a". */
+        private fun releaseAbiOf(name: String): String? {
+            val lower = name.lowercase()
+            return RELEASE_ABIS.firstOrNull { abi ->
+                Regex("(?<![a-z0-9_])${Regex.escape(abi)}(?![a-z0-9_])").containsMatchIn(lower)
+            }
+        }
     }
 }
